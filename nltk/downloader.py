@@ -840,8 +840,11 @@ class Downloader(object):
             for i, child_id in enumerate(collection.children):
                 if child_id in self._packages:
                     collection.children[i] = self._packages[child_id]
-                if child_id in self._collections:
+                elif child_id in self._collections:
                     collection.children[i] = self._collections[child_id]
+                else:
+                    print('removing collection member with no package: {}'.format(child_id))
+                    del collection.children[i]
 
         # Fill in collection.packages for each collection.
         for collection in self._collections.values():
@@ -921,6 +924,10 @@ class Downloader(object):
         permission: ``/usr/share/nltk_data``, ``/usr/local/share/nltk_data``,
         ``/usr/lib/nltk_data``, ``/usr/local/lib/nltk_data``, ``~/nltk_data``.
         """
+        # Check if we are on GAE where we cannot write into filesystem.
+        if 'APPENGINE_RUNTIME' in os.environ:
+            return
+
         # Check if we have sufficient permissions to install in a
         # variety of system-wide locations.
         for nltkdir in nltk.data.path:
@@ -2264,4 +2271,3 @@ if __name__ == '__main__':
         downloader.download(download_dir=options.dir,
             quiet=options.quiet, force=options.force,
             halt_on_error=options.halt_on_error)
-
