@@ -76,7 +76,7 @@ def load_parser(grammar_url, trace=0,
             chart_class = Chart
         return parser(grammar, trace=trace, chart_class=chart_class)
 
-def taggedsent_to_conll(sentences):
+def taggedsents_to_conll(sentences):
 	"""
 	A module to convert the a POS tagged document stream 
 	(i.e. list of list of tuples) and yield lines in CONLL format. 
@@ -85,7 +85,7 @@ def taggedsent_to_conll(sentences):
 	>>> from nltk import word_tokenize, sent_tokenize
 	>>> text = "This is a foobar sentence. Is that right?"
 	>>> sentences = [word_tokenize(sent) for sent in sent_tokenize(text)]
-	>>> for line in taggedsent_to_conll(sentences):
+	>>> for line in taggedsents_to_conll(sentences):
 	...     print(line, end="")
 	1    This    _    DT    DT    _    0    a    _    _
 	2    is    _    VBZ    VBZ    _    0    a    _    _
