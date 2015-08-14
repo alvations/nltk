@@ -142,7 +142,7 @@ machado = LazyCorpusLoader(
     r'(?!\.).*\.txt', cat_pattern=r'([a-z]*)/.*', encoding='latin-1')
 masc_tagged = LazyCorpusLoader(
     'masc_tagged', CategorizedTaggedCorpusReader, r'(spoken|written)/.*\.txt',
-    cat_file='categories.txt', tagset='wsj', encoding="ascii", sep="_")
+    cat_file='categories.txt', tagset='wsj', encoding="utf-8", sep="_")
 movie_reviews = LazyCorpusLoader(
     'movie_reviews', CategorizedPlaintextCorpusReader,
     r'(?!\.).*\.txt', cat_pattern=r'(neg|pos)/.*',
@@ -206,6 +206,8 @@ treebank_chunk = LazyCorpusLoader(
     para_block_reader=tagged_treebank_para_block_reader, encoding='ascii')
 treebank_raw = LazyCorpusLoader(
     'treebank/raw', PlaintextCorpusReader, r'wsj_.*', encoding='ISO-8859-2')
+twitter_samples = LazyCorpusLoader(
+    'twitter_samples', TwitterCorpusReader, '.*\.json')
 udhr = LazyCorpusLoader(
     'udhr', UdhrCorpusReader)
 udhr2 = LazyCorpusLoader(
@@ -252,6 +254,7 @@ semcor = LazyCorpusLoader(
     'semcor', SemcorCorpusReader, r'brown./tagfiles/br-.*\.xml',
     wordnet) # Must be defined *after* wordnet corpus.
 
+  
 def demo():
     # This is out-of-date:
     abc.demo()

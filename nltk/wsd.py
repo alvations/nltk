@@ -55,6 +55,3 @@ def lesk(context_sentence, ambiguous_word, pos=None, synsets=None):
     return sense
 
 
-if __name__ == "__main__":
-    import doctest
-    doctest.testmod(optionflags=doctest.NORMALIZE_WHITESPACE)
