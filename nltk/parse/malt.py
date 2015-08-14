@@ -72,7 +72,8 @@ def find_maltparser(parser_dirname):
 	malt_dependencies = set([u'log4j.jar', u'libsvm.jar', u'liblinear-1.8.jar'])
 					
 	assert malt_dependencies.issubset(_jars)
-	assert any(filter(lambda i: i.startswith('maltparser-') and i.endswith('.jar'), _jars))
+	assert any(filter(lambda i: i.startswith('maltparser-') 
+								and i.endswith('.jar'), _jars))
 	return list(_malt_jars)
 
 
@@ -104,7 +105,7 @@ class MaltParser(ParserI):
         >>> mp.parse_one('I shot an elephant in my pajamas .'.split()).tree() # doctest: +SKIP
         (shot I (elephant an) (in (pajamas my)) .)
         >>> # Without MALT_PARSER and MALT_MODEL environment.
-        >>> mp = malt.MaltParser('/home/alvas/maltparser-1.7.2/', '/home/alvas/engmalt.linear-1.7.mco') # doctest: +SKIP
+        >>> mp = malt.MaltParser('/home/user/maltparser-1.7.2/', '/home/user/engmalt.linear-1.7.mco') # doctest: +SKIP
         >>> mp.parse_one('I shot an elephant in my pajamas .'.split()).tree() # doctest: +SKIP
         (shot I (elephant an) (in (pajamas my)) .)
 	"""
@@ -181,10 +182,10 @@ class MaltParser(ParserI):
 			raise Exception("Parser has not been trained. Call train() first.")
 
 
-		with tempfile.NamedTemporaryFile(prefix='malt_input.conll.', 
-		dir=self.working_dir, mode='w', delete=False) as input_file, \
-		tempfile.NamedTemporaryFile(prefix='malt_output.conll.', 
-		dir=self.working_dir, mode='w', delete=False) as output_file:
+		with (tempfile.NamedTemporaryFile(prefix='malt_input.conll.', 
+				dir=self.working_dir, mode='w', delete=False)) as input_file, (
+				tempfile.NamedTemporaryFile(prefix='malt_output.conll.', 
+				dir=self.working_dir, mode='w', delete=False)) as output_file:
 			# Convert list of sentences to CONLL format.
 			for line in taggedsent_to_conll(sentences):
 				input_file.write(text_type(line))
@@ -380,4 +381,3 @@ if __name__ == '__main__':
 	>>>	print(next(next(parsed_sents)).tree())
 	(flies Time (like banana) .)
 	'''
-	
