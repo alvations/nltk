@@ -90,6 +90,11 @@ def taggedsent_to_conll(sentence):
 	4    foobar    _    NN    NN    _    0    a    _    _
 	5    sentence    _    NN    NN    _    0    a    _    _
 	6    .    _    .    .    _    0    a    _    _
+	
+	:param sentence: A single input sentence to parse
+	:type sentence: list(tuple(str, str))
+	:rtype: iter(str) 
+	:return: a generator yielding a single sentence in CONLL format.
 	"""
 	for (i, (word, tag)) in enumerate(sentence, start=1):
 		input_str = [str(i), word, '_', tag, tag, '_', '0', 'a', '_', '_']
@@ -120,6 +125,11 @@ def taggedsents_to_conll(sentences):
 	2    that    _    IN    IN    _    0    a    _    _
 	3    right    _    JJ    JJ    _    0    a    _    _
 	4    ?    _    .    .    _    0    a    _    _
+
+	:param sentences: Input sentences to parse
+	:type sentence: list(list(tuple(str, str)))
+	:rtype: iter(str) 
+	:return: a generator yielding sentences in CONLL format.
 	"""
 	for sentence in sentences:
 		for input_str in taggedsent_to_conll(sentence):
