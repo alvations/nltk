@@ -79,7 +79,7 @@ Summary of our git branching model:
 
 - Use [PEP8](http://www.python.org/dev/peps/pep-0008/);
 - Write tests for your new features (please see "Tests" topic below);
-- Always remember that [commented code is dead
+- Always remember that [uncommented code is dead
   code](http://www.codinghorror.com/blog/2008/07/coding-without-comments.html);
 - Name identifiers (variables, classes, functions, module names) with readable
   names (`x` is always wrong);
