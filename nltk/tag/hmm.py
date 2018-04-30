@@ -1,6 +1,6 @@
 # Natural Language Toolkit: Hidden Markov Model
 #
-# Copyright (C) 2001-2017 NLTK Project
+# Copyright (C) 2001-2018 NLTK Project
 # Author: Trevor Cohn <tacohn@csse.unimelb.edu.au>
 #         Philip Blunsom <pcbl@csse.unimelb.edu.au>
 #         Tiago Tresoldi <tiago@tresoldi.pro.br> (fixes)
@@ -842,9 +842,11 @@ class HiddenMarkovModelTrainer(object):
         :rtype: HiddenMarkovModelTagger
         :param labelled_sequences: the supervised training data, a set of
             labelled sequences of observations
+            ex: [ (word_1, tag_1),...,(word_n,tag_n) ] 
         :type labelled_sequences: list
         :param unlabeled_sequences: the unsupervised training data, a set of
             sequences of observations
+            ex: [ word_1, ..., word_n ]
         :type unlabeled_sequences: list
         :param kwargs: additional arguments to pass to the training methods
         """

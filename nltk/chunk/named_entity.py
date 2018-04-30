@@ -1,6 +1,6 @@
 # Natural Language Toolkit: Chunk parsing API
 #
-# Copyright (C) 2001-2017 NLTK Project
+# Copyright (C) 2001-2018 NLTK Project
 # Author: Edward Loper <edloper@gmail.com>
 # URL: <http://nltk.org/>
 # For license information, see LICENSE.TXT
@@ -9,6 +9,7 @@
 Named entity chunker
 """
 from __future__ import print_function
+from __future__ import unicode_literals
 
 import os, re, pickle
 from xml.etree import ElementTree as ET
@@ -328,4 +329,3 @@ if __name__ == '__main__':
 
     build_model('binary')
     build_model('multiclass')
-

@@ -1,6 +1,6 @@
 # Natural Language Toolkit: Tokenizers
 #
-# Copyright (C) 2001-2017 NLTK Project
+# Copyright (C) 2001-2018 NLTK Project
 # Author: Yoav Goldberg <yoavg@cs.bgu.ac.il>
 #         Steven Bird <stevenbird1@gmail.com> (minor edits)
 # URL: <http://nltk.sourceforge.net>
@@ -52,6 +52,7 @@ The s-expression tokenizer is also available as a function:
 import re
 
 from nltk.tokenize.api import TokenizerI
+
 
 class SExprTokenizer(TokenizerI):
     """
@@ -125,7 +126,7 @@ class SExprTokenizer(TokenizerI):
                 if self._strict and depth == 0:
                     raise ValueError('Un-matched close paren at char %d'
                                      % m.start())
-                depth = max(0, depth-1)
+                depth = max(0, depth - 1)
                 if depth == 0:
                     result.append(text[pos:m.end()])
                     pos = m.end()
@@ -135,8 +136,5 @@ class SExprTokenizer(TokenizerI):
             result.append(text[pos:])
         return result
 
+
 sexpr_tokenize = SExprTokenizer().tokenize
-
-
-
-
