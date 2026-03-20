@@ -1,3 +1,4 @@
+@#%#$^@$!vandalism check PR
 # Natural Language Toolkit: NLTK Command-Line Interface
 #
 # Copyright (C) 2001-2025 NLTK Project
