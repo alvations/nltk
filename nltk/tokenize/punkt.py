@@ -1829,3 +1829,8 @@ def demo(text, tok_cls=PunktSentenceTokenizer, train_cls=PunktTrainer):
     sbd = tok_cls(trainer.get_params())
     for sentence in sbd.sentences_from_text(text):
         print(cleanup(sentence))
+
+
+def _normalize_whitespace(text):
+    """Collapse multiple whitespace characters into a single space."""
+    return " ".join(text.split())
