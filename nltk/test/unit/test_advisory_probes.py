@@ -80,6 +80,19 @@ def test_pathsec_enforce_probe_has_teeth():
     assert probe()[0] == probes.FIXED
 
 
+def test_model_artifact_probe_has_teeth():
+    import nltk.pathsec as pathsec
+
+    probe = probes.PROBES["GHSA-8mgp-746c-j5xp"]
+    original = pathsec.ENFORCE
+    try:
+        pathsec.ENFORCE = False
+        assert probe()[0] == probes.VULNERABLE
+    finally:
+        pathsec.ENFORCE = original
+    assert probe()[0] == probes.FIXED
+
+
 def test_pickle_allowlist_probe_has_teeth():
     from nltk.picklesec import AllowlistUnpickler
 
