@@ -1,3 +1,8 @@
+"""
+Unit tests for nltk.cluster: the vector space clusterers' normalisation and
+SVD preprocessing and cluster assignment.
+"""
+
 import random
 
 import pytest
@@ -47,7 +52,7 @@ def test_cluster_assignments_after_preprocessing(
 
 
 @pytest.mark.parametrize("normalise", [False, True])
-def test_gaac_cluster_assignments(normalise):
+def test_gaa_cluster_assignments(normalise):
     vectors = np.array([[3.0, 1.0], [4.0, 1.0], [-3.0, -1.0], [-4.0, -1.0]])
     clusterer = GAAClusterer(2, normalise=normalise)
 

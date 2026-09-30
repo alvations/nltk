@@ -38,6 +38,12 @@ class VectorSpaceClusterer(ClusterI):
         self._svd_dimensions = svd_dimensions
 
     def cluster(self, vectors, assign_clusters=False, trace=False):
+        """
+        Cluster ``vectors`` after the configured normalisation and SVD
+        reduction.  With ``assign_clusters`` the cluster name of every input
+        vector is returned; each is computed by ``classify`` from the vector
+        as given, so it matches what ``classify`` returns for it afterwards.
+        """
         assert len(vectors) > 0
         original_vectors = vectors
 
