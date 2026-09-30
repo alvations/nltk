@@ -22,7 +22,10 @@ import warnings
 from abc import abstractmethod
 from subprocess import PIPE
 
+from nltk import pathsec
+from nltk.data import staging_tempdir
 from nltk.internals import find_file, find_jar, java
+from nltk.pathsec import validate_tool_path
 from nltk.tag.api import TaggerI
 
 _stanford_url = "https://nlp.stanford.edu/software"
@@ -74,6 +77,15 @@ class StanfordTagger(TaggerI):
         self._stanford_model = find_file(
             model_filename, env_vars=("STANFORD_MODELS",), verbose=verbose
         )
+        # Fail fast: the model is a JVM subprocess argument, so bound it here as
+        # well as at the hand-off, refuse a tamperable or oversized model, and
+        # keep only the checked string, never an out-of-sandbox path or object.
+        self._stanford_model = validate_tool_path(
+            self._stanford_model,
+            context=f"{type(self).__name__}",
+            max_bytes=pathsec.MAX_TOOL_MODEL_BYTES,
+            require_private=True,
+        )
 
         self._encoding = encoding
         self.java_options = java_options
@@ -96,9 +108,20 @@ class StanfordTagger(TaggerI):
         java_succeeded = False
         try:
             # Create a temporary input file
-            _input_fh, input_file_path = tempfile.mkstemp(text=True)
+            _input_fh, input_file_path = tempfile.mkstemp(
+                text=True, dir=staging_tempdir()
+            )
             self._input_file_path = input_file_path
 
+            # The model is handed to the JVM subprocess pathsec.open cannot wrap:
+            # re-check it and freeze the checked string BEFORE _cmd reads it, so
+            # the argv never carries a swapped or re-resolving value (GHSA-8mgp).
+            self._stanford_model = validate_tool_path(
+                self._stanford_model,
+                context="StanfordTagger.tag_sents",
+                max_bytes=pathsec.MAX_TOOL_MODEL_BYTES,
+                require_private=True,
+            )
             cmd = list(self._cmd)
             cmd.extend(["-encoding", encoding])
 

@@ -166,11 +166,13 @@ def test_no_payload_reads_a_sentinel_outside_the_data_root():
 
 
 def test_double_encoded_stays_literal_in_root():
-    """``..%252f`` / overlong ``..%c0%af`` pass the string guard but url2pathname
-    single-decodes, so they are a *literal in-root filename*, never a separator.
-    This is the exact spot a future double-decode bug would regress, so assert
-    the behaviour explicitly: not-found (LookupError) or a path inside the root,
-    never a ValueError-worthy escape and never a leak."""
+    """``..%252f`` / overlong ``..%c0%af`` never become a separator. url2pathname
+    single-decodes ``%252f`` to the literal ``%2f`` and surrogate-escapes the overlong
+    bytes, so on POSIX they are a *literal in-root filename*. This is the exact spot a
+    future double-decode bug would regress, so assert the behaviour explicitly: the
+    name is not-found (LookupError), or, where url2pathname cannot parse the bytes
+    (Windows 3.14+ raises), rejected by the normalization guard (ValueError). Every
+    branch is a rejection: never a separator/traversal, never a leak."""
     base = tempfile.mkdtemp()
     dataroot = os.path.join(base, "nltk_data")
     os.makedirs(dataroot)
@@ -183,11 +185,24 @@ def test_double_encoded_stays_literal_in_root():
         for p in ("..%252fsecret.txt", "..%252f..%252fsecret.txt"):
             with pytest.raises(LookupError):
                 D.find(p)
-        # Overlong-UTF-8 ``%c0%af`` never decodes to "/". On Python <3.14 unquote
-        # replaces the bytes (-> literal in-root -> LookupError); on 3.14+ unquote
-        # raises UnicodeDecodeError. Either way it is rejected, never a leak.
-        with pytest.raises((LookupError, UnicodeDecodeError)):
-            D.find("..%c0%afsecret.txt")
+        # Overlong-UTF-8 ``%c0%af`` never decodes to "/". On POSIX url2pathname
+        # surrogate-escapes the bytes (-> literal in-root -> LookupError). On Windows
+        # 3.14+ url2pathname raises on the invalid bytes and the normalization guard
+        # fail-closes that into a ValueError ("Unsafe resource path"). Assert BOTH that
+        # it is rejected AND (the real security invariant, not the exact exception
+        # type) that it never resolves to the readable sentinel, so a future
+        # double-decode regression that returned a pointer instead of raising would
+        # still fail here.
+        payload = "..%c0%afsecret.txt"
+        with pytest.raises((LookupError, UnicodeDecodeError, ValueError)):
+            D.find(payload)
+        try:
+            leaked = D.find(payload).open().read()
+        except (LookupError, UnicodeDecodeError, ValueError):
+            leaked = b""
+        if isinstance(leaked, bytes):
+            leaked = leaked.decode("latin-1", "replace")
+        assert "SENTINEL" not in leaked, "overlong-UTF-8 traversal leaked the secret"
     finally:
         D.path[:] = saved
 
@@ -335,8 +350,20 @@ class TestPathsecSymlinkHardening:
 # ==========================================================================
 
 
-@pytest.mark.skipif(os.name != "posix", reason="symlink squat is a POSIX concern")
 class TestPerceptronSaveSquat:
+    """The trained-model save destination is a caller-supplied directory: every
+    hostile ``loc`` must be refused and every benign in-root ``loc`` must succeed.
+
+    Each case is staged inside a *registered* pathsec data root (the
+    ``restricted_sandbox`` / ``pathsec_sandbox`` conftest fixtures) rather than a
+    bare ``tempfile.mkdtemp()``. The system temp dir is an allowed root on macOS
+    (per-user ``/var/folders`` mode 0700) but not on Linux/CI (world-writable
+    ``/tmp``), so an unregistered temp path let the benign save pass locally yet
+    fail on CI with an Unauthorized-path refusal. Registering the root keeps the
+    guard strict while giving the benign write a legitimate home; the hostile
+    cases then exercise the atomic squat/containment refusals on every platform.
+    """
+
     def _tagger(self):
         from nltk.tag.perceptron import PerceptronTagger
 
@@ -346,38 +373,93 @@ class TestPerceptronSaveSquat:
         t.classes = {"NN", "DT"}
         return t
 
-    def test_benign_save_is_private_and_roundtrips(self):
-        base = tempfile.mkdtemp()
-        loc = os.path.join(base, "model_dir")
-        t = self._tagger()
-        t.save_to_json(lang="eng", loc=loc)
+    def test_benign_save_is_private_and_roundtrips(self, restricted_sandbox):
+        from nltk.data import FileSystemPathPointer
+        from nltk.tag.perceptron import PerceptronTagger
+
+        loc = os.path.join(restricted_sandbox, "model_dir")
+        self._tagger().save_to_json(lang="eng", loc=loc)
         files = os.listdir(loc)
         assert files, "no model files written"
-        for f in files:
-            # written model must not be group-/world-readable (CWE-377/378)
-            assert (os.stat(os.path.join(loc, f)).st_mode & 0o077) == 0
+        if os.name == "posix":
+            # written model must not be group-/world-readable (CWE-377/378).
+            # POSIX-only: Windows os.stat reports a fixed 0o666 for every regular
+            # file (no POSIX permission bits), so this mask is meaningless there;
+            # the real privacy on Windows is the per-user ACL on %TEMP%.
+            for f in files:
+                assert (os.stat(os.path.join(loc, f)).st_mode & 0o077) == 0
+        # A real load round trip reads the weights/tagdict back unchanged.
+        back = PerceptronTagger(load=False)
+        back.load_from_json(lang="eng", loc=FileSystemPathPointer(loc))
+        assert back.model.weights == {"feat": {"NN": 1.0}}
+        assert back.tagdict == {"the": "DT"}
 
-    def test_symlinked_save_location_is_refused(self):
-        # The default save dir is a guessable name in a shared temp dir; a local
-        # attacker who pre-plants a symlink there must not capture/redirect the
-        # model write.
-        base = tempfile.mkdtemp()
-        victim = os.path.join(base, "attacker_dir")
+    @pytest.mark.skipif(os.name != "posix", reason="symlink squat is a POSIX concern")
+    def test_symlinked_save_location_is_refused(self, restricted_sandbox):
+        # A local attacker who pre-plants a symlink at the guessable save dir must
+        # not capture/redirect the model write. Both the squat and its target live
+        # inside the data root, so it is the atomic O_NOFOLLOW open that refuses,
+        # on every platform, not the containment check incidentally rejecting a
+        # temp path (which is what happened on Linux before).
+        victim = os.path.join(restricted_sandbox, "attacker_dir")
         os.makedirs(victim)
-        squat = os.path.join(base, "squat")
+        squat = os.path.join(restricted_sandbox, "squat")
         os.symlink(victim, squat)
         with pytest.raises(PermissionError):
             self._tagger().save_to_json(lang="eng", loc=squat)
         assert not os.listdir(victim), "write leaked through the symlink"
 
-    def test_world_writable_save_location_is_refused(self):
+    @pytest.mark.skipif(
+        os.name != "posix", reason="world-writable mode is a POSIX concern"
+    )
+    def test_world_writable_save_location_is_refused(self, restricted_sandbox):
         # A pre-existing real dir at the guessable name that is world-writable
         # (an attacker could drop files in it / read the model back) is refused.
-        base = tempfile.mkdtemp()
-        loc = os.path.join(base, "shared")
+        loc = os.path.join(restricted_sandbox, "shared")
         os.makedirs(loc)
         os.chmod(loc, 0o777)
         with pytest.raises(PermissionError):
+            self._tagger().save_to_json(lang="eng", loc=loc)
+
+    # ---- expanded hostile-loc surface: each must be REFUSED (CWE-22/59/377) ----
+
+    def test_traversal_loc_is_refused(self, restricted_sandbox):
+        # A '..' component may not climb out of the data root.
+        loc = os.path.join(restricted_sandbox, "..", "..", "etc", "nltk_squat")
+        with pytest.raises((PermissionError, ValueError)):
+            self._tagger().save_to_json(lang="eng", loc=loc)
+
+    def test_nul_in_loc_is_refused(self, restricted_sandbox):
+        # A NUL truncates the path in a native layer, naming a different dir there.
+        loc = os.path.join(restricted_sandbox, "model\x00dir")
+        with pytest.raises((PermissionError, ValueError)):
+            self._tagger().save_to_json(lang="eng", loc=loc)
+
+    def test_absolute_outside_loc_is_refused(self, sandbox):
+        # `sandbox` yields a real directory OUTSIDE every allowed root.
+        loc = os.path.join(str(sandbox), "model_dir")
+        with pytest.raises(PermissionError):
+            self._tagger().save_to_json(lang="eng", loc=loc)
+
+    @pytest.mark.skipif(
+        os.name != "posix", reason="a symlinked parent is a POSIX concern"
+    )
+    def test_parent_symlink_escaping_root_is_refused(self, pathsec_sandbox):
+        # The leaf name is benign but its PARENT is a symlink pointing OUTSIDE the
+        # data root; containment must resolve through it and refuse (TOCTOU).
+        root, outside = pathsec_sandbox
+        parent = os.path.join(str(root), "parent")
+        os.symlink(str(outside), parent)
+        with pytest.raises(PermissionError):
+            self._tagger().save_to_json(lang="eng", loc=os.path.join(parent, "child"))
+
+    @pytest.mark.skipif(
+        os.name == "posix", reason="reserved device names are a Windows concern"
+    )
+    def test_windows_device_name_loc_is_refused(self, restricted_sandbox):
+        # 'NUL' resolves to the null device in any directory on Windows.
+        loc = os.path.join(restricted_sandbox, "NUL")
+        with pytest.raises((PermissionError, ValueError)):
             self._tagger().save_to_json(lang="eng", loc=loc)
 
 

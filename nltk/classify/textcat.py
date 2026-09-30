@@ -29,6 +29,8 @@ https://borel.slu.edu/crubadan/index.html
 
 from sys import maxsize
 
+from nltk import redos
+from nltk.termsec import safe_print
 from nltk.util import trigrams
 
 # Note: this is NOT "re" you're likely used to. The regex module
@@ -70,7 +72,7 @@ class TextCat:
 
     def remove_punctuation(self, text):
         """Get rid of punctuation except apostrophes"""
-        return re.sub(r"[^\P{P}\']+", "", text)
+        return redos.sub(r"[^\P{P}\']+", "", text)
 
     def profile(self, text):
         """Create FreqDist of trigrams within text"""
@@ -265,10 +267,10 @@ def demo():
             sample += cur_sent
 
         # Try to detect what it is
-        print("Language snippet: " + sample[0:140] + "...")
+        safe_print("Language snippet: " + sample[0:140] + "...")
         guess = tc.guess_language(sample)
-        print(f"Language detection: {guess} ({friendly[guess]})")
-        print("#" * 140)
+        safe_print(f"Language detection: {guess} ({friendly[guess]})")
+        safe_print("#" * 140)
 
 
 if __name__ == "__main__":

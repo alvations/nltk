@@ -13,6 +13,7 @@ Named entity chunker
 import os
 import re
 
+from nltk import redos
 from nltk.pathsec import open as pathsec_open
 from nltk.pathsec import validate_tool_dir
 from nltk.tag import ClassifierBasedTagger, pos_tag
@@ -27,6 +28,7 @@ except ImportError:
 from nltk.chunk.api import ChunkParserI
 from nltk.chunk.util import ChunkScore
 from nltk.data import find, make_staging_dir
+from nltk.termsec import safe_print
 from nltk.tokenize import word_tokenize
 from nltk.tree import Tree
 
@@ -171,7 +173,7 @@ class NEChunkParser(ChunkParserI):
         for child in sent:
             if isinstance(child, Tree):
                 if len(child) == 0:
-                    print("Warning; empty chunk in sentence")
+                    safe_print("Warning; empty chunk in sentence")
                     continue
                 toks.append((child[0], f"B-{child.label()}"))
                 for tok in child[1:]:
@@ -182,11 +184,11 @@ class NEChunkParser(ChunkParserI):
 
 
 def shape(word):
-    if re.match(r"[0-9]+(\.[0-9]*)?|[0-9]*\.[0-9]+$", word, re.UNICODE):
+    if redos.match(r"[0-9]+(\.[0-9]*)?|[0-9]*\.[0-9]+$", word, re.UNICODE):
         return "number"
-    elif re.match(r"\W+$", word, re.UNICODE):
+    elif redos.match(r"\W+$", word, re.UNICODE):
         return "punct"
-    elif re.match(r"\w+$", word, re.UNICODE):
+    elif redos.match(r"\w+$", word, re.UNICODE):
         if word.istitle():
             return "upcase"
         elif word.islower():
@@ -230,7 +232,7 @@ def load_ace_data(roots, fmt="binary", skip_bnews=True):
 
 
 def load_ace_file(textfile, fmt):
-    print(f"  - {os.path.split(textfile)[1]}")
+    safe_print(f"  - {os.path.split(textfile)[1]}")
     annfile = textfile + ".tmx.rdc.xml"
 
     # Read the xml file, and get a list of entities. These ACE paths are walked
@@ -253,18 +255,18 @@ def load_ace_file(textfile, fmt):
         text = infile.read()
 
     # Strip XML tags, since they don't count towards the indices
-    text = re.sub("<(?!/?TEXT)[^>]+>", "", text)
+    text = redos.sub("<(?!/?TEXT)[^>]+>", "", text)
 
     # Blank out anything before/after <TEXT>
     def subfunc(m):
         return " " * (m.end() - m.start() - 6)
 
-    text = re.sub(r"[\s\S]*<TEXT>", subfunc, text)
-    text = re.sub(r"</TEXT>[\s\S]*", "", text)
+    text = redos.sub(r"[\s\S]*<TEXT>", subfunc, text)
+    text = redos.sub(r"</TEXT>[\s\S]*", "", text)
 
     # Simplify quotes
-    text = re.sub("``", ' "', text)
-    text = re.sub("''", '" ', text)
+    text = redos.sub("``", ' "', text)
+    text = redos.sub("''", '" ', text)
 
     entity_types = {typ for (s, e, typ) in entities}
 
@@ -311,12 +313,12 @@ def cmp_chunks(correct, guessed):
     for (w, ct), (w, gt) in zip(correct, guessed):
         if ct == gt == "O":
             if not ellipsis:
-                print(f"  {ct:15} {gt:15} {w}")
-                print("  {:15} {:15} {}".format("...", "...", "..."))
+                safe_print(f"  {ct:15} {gt:15} {w}")
+                safe_print("  {:15} {:15} {}".format("...", "...", "..."))
                 ellipsis = True
         else:
             ellipsis = False
-            print(f"  {ct:15} {gt:15} {w}")
+            safe_print(f"  {ct:15} {gt:15} {w}")
 
 
 # ======================================================================================

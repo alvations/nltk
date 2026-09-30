@@ -18,7 +18,6 @@ consulted instead.  Any SequentialBackoffTagger may serve as a
 backoff tagger for any other SequentialBackoffTagger.
 """
 import ast
-import re
 from abc import abstractmethod
 from typing import List, Optional, Tuple
 
@@ -26,6 +25,7 @@ from nltk import jsontags, redos
 from nltk.classify import NaiveBayesClassifier
 from nltk.probability import ConditionalFreqDist
 from nltk.tag.api import FeaturesetTaggerI, TaggerI
+from nltk.termsec import safe_print
 
 
 ######################################################################
@@ -205,8 +205,8 @@ class ContextTagger(SequentialBackoffTagger):
             size = len(self._context_to_tag)
             backoff = 100 - (hit_count * 100.0) / token_count
             pruning = 100 - (size * 100.0) / len(fd.conditions())
-            print("[Trained Unigram tagger:", end=" ")
-            print(
+            safe_print("[Trained Unigram tagger:", end=" ")
+            safe_print(
                 "size={}, backoff={:.2f}%, pruning={:.2f}%]".format(
                     size, backoff, pruning
                 )
@@ -667,7 +667,7 @@ class ClassifierBasedTagger(SequentialBackoffTagger, FeaturesetTaggerI):
 
         classifier_corpus = []
         if verbose:
-            print("Constructing training corpus for classifier.")
+            safe_print("Constructing training corpus for classifier.")
 
         for sentence in tagged_corpus:
             history = []
@@ -678,7 +678,7 @@ class ClassifierBasedTagger(SequentialBackoffTagger, FeaturesetTaggerI):
                 history.append(tags[index])
 
         if verbose:
-            print(f"Training classifier ({len(classifier_corpus)} instances)")
+            safe_print(f"Training classifier ({len(classifier_corpus)} instances)")
         self._classifier = classifier_builder(classifier_corpus)
 
     def __repr__(self):
@@ -727,15 +727,15 @@ class ClassifierBasedPOSTagger(ClassifierBasedTagger):
             prevtag = history[index - 1]
             prevprevtag = history[index - 2]
 
-        if re.match(r"[0-9]+(\.[0-9]*)?|[0-9]*\.[0-9]+$", word):
+        if redos.match(r"[0-9]+(\.[0-9]*)?|[0-9]*\.[0-9]+$", word):
             shape = "number"
-        elif re.match(r"\W+$", word):
+        elif redos.match(r"\W+$", word):
             shape = "punct"
-        elif re.match("[A-Z][a-z]+$", word):
+        elif redos.match("[A-Z][a-z]+$", word):
             shape = "upcase"
-        elif re.match("[a-z]+$", word):
+        elif redos.match("[a-z]+$", word):
             shape = "downcase"
-        elif re.match(r"\w+$", word):
+        elif redos.match(r"\w+$", word):
             shape = "mixedcase"
         else:
             shape = "other"

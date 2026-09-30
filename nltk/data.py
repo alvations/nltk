@@ -51,15 +51,21 @@ from io import BytesIO, TextIOWrapper
 from urllib.parse import unquote
 from urllib.request import url2pathname
 
+from nltk import redos
 from nltk.pathsec import ZipFile
 from nltk.pathsec import open as _secure_open
 from nltk.pathsec import urlopen as _secure_urlopen
 from nltk.pathsec import validate_path as _validate_path
 
 # Reject unsafe no-protocol paths: traversal segments, trailing '..', absolute paths,
-# backslashes, Windows drive letters. Use a raw-string pattern and do not anchor only
-# at the start — we'll use search() for safety checks.
-_UNSAFE_NO_PROTOCOL_RE = re.compile(r"(?:\.\./|\.\.$|^/|\\|[A-Za-z]:[/\\])")
+# backslashes, and any ':' or '|'. On Windows url2pathname turns ':' or '|' in the first
+# component into a drive ("a:b" -> "A:b", drive-relative, so os.path.isabs is blind to
+# it) or an alternate data stream, either of which escapes the data root; neither
+# character ever belongs in a legitimate no-protocol resource name (the scheme ':' is
+# stripped upstream by split_resource_url), so refusing them on every platform is both
+# safe and deterministic across the OS test matrix. Use a raw-string pattern and do not
+# anchor only at the start — we'll use search() for safety checks.
+_UNSAFE_NO_PROTOCOL_RE = redos.compile(r"(?:\.\./|\.\.$|^/|\\|[:|])")
 
 
 def _assert_no_encoded_bypass(name, error_label=None):
@@ -96,31 +102,124 @@ def _assert_no_encoded_bypass(name, error_label=None):
 
 
 # Python 3.14's url2pathname follows the WHATWG URL rules, so it silently strips
-# ASCII tab / LF / CR and truncates at "#" or "?". Earlier versions keep them.
-_URL_REWRITTEN_CHARS_RE = re.compile(r"[\t\n\r#?]")
+# ASCII tab / LF / CR and truncates at "#" or "?". Refuse the whole control-char
+# range (C0 0x00-0x1f, DEL 0x7f) plus the Unicode newline-likes (NEL 0x85, line
+# and paragraph separators 0x2028/0x2029) and #/?, not just the three characters
+# stripped today: none belongs in a resource name, and refusing them all means a
+# FUTURE url2pathname that strips a different control cannot splice a "../" the
+# raw-form check never saw. Truncation only ever happens at "#"/"?".
+_URL_REWRITTEN_CHARS_RE = redos.compile(r"[\x00-\x1f\x7f\x85\u2028\u2029#?]")
+
+# A fixed, absolute reference root used only to containment-test what url2pathname
+# produces (never touched on disk, never joined with anything but our own constant).
+# It is a hardcoded literal (no attacker input and no cwd/abspath call reaches it, so
+# it cannot itself become a vector) and is already absolute on its platform: a drive
+# on Windows, a leading separator on POSIX.
+_NO_PROTOCOL_REF_ROOT = (
+    "C:\\nltk-no-protocol-ref-root"
+    if os.name == "nt"
+    else os.sep + "nltk-no-protocol-ref-root"
+)
+# url2pathname may emit either separator (Windows rewrites "/"->"\\"); split on both.
+_PATH_COMPONENT_RE = redos.compile(r"[\\/]")
+
+
+#: readline re-splits a buffer up to this many characters on every pass without
+#: first asking whether the fresh span holds a boundary; past it, it asks.
+_SPLIT_DIRECTLY_BELOW = 8192
+
+
+def _has_line_boundary(text):
+    """True when *text* holds a line boundary ``str.splitlines`` recognises.
+
+    readline asks this of each freshly read span, prefixed with the previous
+    span's last character, before it re-splits a buffer past the bound. The
+    prefix is for a complete line the line buffer carried over: that line ends
+    in a boundary, and without the prefix readline would pull the whole next
+    line before returning it. ``splitlines`` is the definition readline splits
+    by, so asking it keeps the two in lockstep for every boundary (LF, CR,
+    CR LF, the vertical and form feeds, the file, group and record separators,
+    NEL and the line and paragraph separators). It runs in C and is linear in
+    the span, with no regex: a timed regex here cost several times the rest of
+    readline.
+    """
+    return bool(text) and text.splitlines() != [text]
+
+
+def _normalized_path_escapes(name):
+    """
+    Return True if :func:`url2pathname` would rewrite *name* into a path that
+    escapes a data root on the running platform.
+
+    Containment test, the approach path libraries use (Werkzeug ``safe_join``,
+    Django, Flask ``send_from_directory``) rather than enumerating patterns:
+    ``os.path.join`` lets an absolute / drive / drive-relative / UNC result
+    override the reference root, ``normpath`` collapses ``..``, so any escape from
+    the join is an escape from the real data root too. It runs with the
+    interpreter's own ``url2pathname`` + ``os.path``, i.e. the exact sink ``find()``
+    will use, so it is correct on whatever platform it executes on (the Windows
+    drive/``|``/``:`` rewrites are handled ahead of it by :data:`_UNSAFE_NO_PROTOCOL_RE`
+    on every platform). A path component made only of dots and spaces is also
+    refused: Windows strips trailing dots/spaces per component at open time, so
+    ``.. `` (or ``..%20``) opens ``..`` (a traversal ``normpath`` does not model),
+    and no legitimate resource component is dots-and-spaces only.
+    """
+    try:
+        rewritten = url2pathname(name)
+    except Exception:
+        # Fail closed: if the sink cannot even parse the name (url2pathname can
+        # raise ValueError/OSError and, on some versions, IndexError), we cannot
+        # reason about where it points, so refuse it rather than let it through.
+        return True
+    resolved = os.path.normpath(os.path.join(_NO_PROTOCOL_REF_ROOT, rewritten))
+    if resolved != _NO_PROTOCOL_REF_ROOT and not resolved.startswith(
+        _NO_PROTOCOL_REF_ROOT + os.sep
+    ):
+        return True
+    for component in _PATH_COMPONENT_RE.split(rewritten):
+        if component and not component.strip(". "):
+            return True
+    return False
 
 
 def _assert_no_normalized_bypass(name, error_label=None):
     """
-    Reject *name* if :func:`url2pathname` would silently rewrite it.
+    Reject *name* if :func:`url2pathname` would rewrite it into an escaping path.
 
-    Sibling of :func:`_assert_no_encoded_bypass`, for the same "the name that
-    was validated must be the name that is used" rule but a different rewriting
-    step. Python 3.14 made ``url2pathname`` follow the WHATWG URL rules: it
-    strips ASCII tab, LF and CR and truncates at ``#`` or ``?``. Stripping can
-    *create* a traversal that the raw-form check never saw, because ``".\\n./x"``
-    contains no ``../`` yet becomes ``"../x"`` once converted, which then joins
-    onto the data root and escapes it (CWE-22).
+    Sibling of :func:`_assert_no_encoded_bypass`, for the same "the name that was
+    validated must be the name that is used" rule. url2pathname does more than one
+    rewrite and its exact behaviour changes across Python versions (3.14 follows
+    the WHATWG rules: it strips ASCII tab/LF/CR and truncates at ``#``/``?``), so
+    two independent layers guard it rather than one enumerated character list:
 
-    None of these characters belongs in an NLTK resource name, so refusing them
-    outright keeps the validated and the used name identical on every Python
-    version, rather than tracking what the standard library normalises next.
+    1. Refuse EVERY control character (C0, DEL, NEL and the Unicode line and
+       paragraph separators) plus ``#``/``?`` outright. None belongs in a resource
+       name, and any of them could be stripped or truncated by some url2pathname,
+       splicing a ``../`` or a leading ``/`` the raw-form check never saw
+       (``".\\n./x"`` has no ``../`` yet becomes ``"../x"``) (CWE-22). This layer
+       is version- and platform-agnostic.
+
+    2. Apply the SINK's own transform, then CONTAINMENT-test the result against a
+       fixed reference root, the approach path libraries use (Werkzeug
+       ``safe_join``, Django, Flask ``send_from_directory``) instead of enumerating
+       dangerous patterns. ``os.path.join`` lets an absolute / drive / ``..`` result
+       override the root and ``normpath`` collapses ``..``, so any escape from the
+       join escapes the real data root too. Also reject any path component made only
+       of dots and spaces: Windows strips trailing dots/spaces per component at open
+       time, so ``.. `` (or ``..%20``) opens ``..``, a traversal ``normpath`` does
+       not model, and no legitimate resource component is dots-and-spaces only.
+       (Both live in :func:`_normalized_path_escapes`.) The Windows drive / ``|`` /
+       ``:`` / UNC rewrites are handled ahead of this by :data:`_UNSAFE_NO_PROTOCOL_RE`
+       (which refuses every ``:`` and ``|``) on every platform, so this containment
+       test does not depend on the deprecated ``nturl2path`` to be correct on Windows.
 
     :param name: The resource string to validate.
     :param error_label: Optional alternative string for the error message.
     """
+    label = name if error_label is None else error_label
     if _URL_REWRITTEN_CHARS_RE.search(name):
-        label = name if error_label is None else error_label
+        raise ValueError(f"Unsafe resource path: {label!r}")
+    if _normalized_path_escapes(name):
         raise ValueError(f"Unsafe resource path: {label!r}")
 
 
@@ -141,6 +240,10 @@ def _reject_unsafe_no_protocol(resource_url):
     if _UNSAFE_NO_PROTOCOL_RE.search(resource_url):
         raise ValueError(f"Unsafe resource path: {resource_url!r}")
     _assert_no_encoded_bypass(resource_url)
+    # The deny-list above requires the two traversal dots to be adjacent; a
+    # control char that url2pathname later strips could split them. Re-check the
+    # normalized form (as find() does) so the no-protocol path can't diverge.
+    _assert_no_normalized_bypass(resource_url)
 
 
 try:
@@ -150,6 +253,7 @@ except ImportError:
 
 from nltk import grammar, sem
 from nltk.internals import deprecated
+from nltk.termsec import safe_print
 
 textwrap_indent = functools.partial(textwrap.indent, prefix="  ")
 
@@ -459,7 +563,7 @@ def split_resource_url(resource_url):
         if path_.startswith("/"):
             path_ = "/" + path_.lstrip("/")
     else:
-        path_ = re.sub(r"^/{0,2}", "", path_)
+        path_ = redos.sub(r"^/{0,2}", "", path_)
 
     return protocol, path_
 
@@ -530,7 +634,7 @@ def normalize_resource_url(resource_url):
         # Reject Windows drive-letter paths even when explicitly using the
         # nltk: protocol. This prevents smuggling filesystem paths through
         # nltk: URLs.
-        if re.match(r"^[A-Za-z]:[/\\]", name):
+        if redos.match(r"^[A-Za-z]:[/\\]", name):
             raise ValueError(f"Unsafe resource path: {resource_url!r}")
         # If "nltk:" is used with an absolute path, treat it as "file://"
         if os.path.isabs(name):
@@ -579,13 +683,13 @@ def normalize_resource_name(resource_name, allow_relative=True, relative_path=No
     >>> windows or normalize_resource_name('/dir/file', True, '/') == '/dir/file'
     True
     """
-    is_dir = bool(re.search(r"[\\/.]$", resource_name)) or resource_name.endswith(
+    is_dir = bool(redos.search(r"[\\/.]$", resource_name)) or resource_name.endswith(
         os.path.sep
     )
     if _is_windows():
         resource_name = resource_name.lstrip("/")
     else:
-        resource_name = re.sub(r"^/+", "/", resource_name)
+        resource_name = redos.sub(r"^/+", "/", resource_name)
     if allow_relative:
         resource_name = os.path.normpath(resource_name)
     else:
@@ -1134,7 +1238,7 @@ def find(resource_name, paths=None):
     # DOTALL matters for termination, not just matching: without it a name
     # containing a newline never looks like a zip, so the ".zip/" fallback below
     # recurses on an ever-growing name instead of stopping (CWE-407 / CWE-1333).
-    m = re.match(r"(.*?\.zip)/?(.*)$", resource_name, re.DOTALL)
+    m = redos.match(r"(.*?\.zip)/?(.*)$", resource_name, re.DOTALL)
     if m:
         zipfile, zipentry = m.groups()
     else:
@@ -1276,13 +1380,13 @@ def retrieve(resource_url, filename=None, verbose=True):
         if resource_url.startswith("file:"):
             filename = os.path.split(resource_url)[-1]
         else:
-            filename = re.sub(r"(^\w+:)?.*/", "", resource_url)
+            filename = redos.sub(r"(^\w+:)?.*/", "", resource_url)
     if os.path.exists(filename):
         filename = os.path.abspath(filename)
         raise ValueError("File %r already exists!" % filename)
 
     if verbose:
-        print(f"Retrieving {resource_url!r}, saving to {filename!r}")
+        safe_print(f"Retrieving {resource_url!r}, saving to {filename!r}")
 
     # Open the input & output streams.
     infile = _open(resource_url)
@@ -1496,14 +1600,14 @@ def load(
         resource_val = _resource_cache.get((resource_url, format))
         if resource_val is not None:
             if verbose:
-                print(f"<<Using cached copy of {resource_url}>>")
+                safe_print(f"<<Using cached copy of resource (format={format})>>")
             return resource_val
 
     protocol, path_ = split_resource_url(resource_url)
 
     if path_[-7:] == ".pickle":
         if verbose:
-            print(f"<<Loading pickle-free alternative to {resource_url}>>")
+            safe_print("<<Loading pickle-free alternative>>")
         fil = os.path.split(path_[:-7])[-1]
         if path_.startswith("tokenizers/punkt"):
             return switch_punkt(fil)
@@ -1516,7 +1620,7 @@ def load(
 
     # Let the user know what's going on.
     if verbose:
-        print(f"<<Loading {resource_url}>>")
+        safe_print("<<Loading resource>>")
 
     # Load the resource.
     opened_resource = _open(resource_url)
@@ -1526,11 +1630,14 @@ def load(
     elif format == "pickle":
         resource_val = restricted_pickle_load(opened_resource.read())
     elif format == "json":
-        import json
+        from nltk.jsontags import json_tags, safe_json_load
 
-        from nltk.jsontags import json_tags
-
-        resource_val = json.load(opened_resource)
+        # Bound size and structural depth before the recursive C JSON decoder:
+        # a data-root resource is only as trusted as its contents, and deeply
+        # nested JSON can segfault the interpreter (safe_json_load rejects it).
+        resource_val = safe_json_load(
+            opened_resource, context=f"nltk.data.load({resource_url})"
+        )
         tag = None
         if len(resource_val) != 1:
             tag = next(resource_val.keys())
@@ -1614,9 +1721,9 @@ def show_cfg(resource_url, escape="##"):
     for l in lines:
         if l.startswith(escape):
             continue
-        if re.match("^$", l):
+        if redos.match("^$", l):
             continue
-        print(l)
+        safe_print(l)
 
 
 def clear_cache():
@@ -1874,11 +1981,16 @@ class SeekableUnicodeStreamReader:
             return line
 
         readsize = size or 72
-        chars = ""
+        # Collect the spans in a list and join only when a line break shows up
+        # or at end of stream: growing a str in place copied it on every pass
+        # (the residual quadratic the j8g8 probe caught on Windows, CWE-407).
+        parts = []
+        buffered = 0  # characters collected in parts
 
         # If there's a remaining incomplete line in the buffer, add it.
         if self.linebuffer:
-            chars += self.linebuffer.pop()
+            parts.append(self.linebuffer.pop())
+            buffered = len(parts[0])
             self.linebuffer = None
 
         while True:
@@ -1890,23 +2002,32 @@ class SeekableUnicodeStreamReader:
             if new_chars and new_chars.endswith("\r"):
                 new_chars += self._read(1)
 
-            chars += new_chars
-            lines = chars.splitlines(True)
-            if len(lines) > 1:
-                line = lines[0]
-                self.linebuffer = lines[1:]
-                self._rewind_numchars = len(new_chars) - (len(chars) - len(line))
-                self._rewind_checkpoint = startpos
-                break
-            elif len(lines) == 1:
-                line0withend = lines[0]
-                line0withoutend = lines[0].splitlines(False)[0]
-                if line0withend != line0withoutend:  # complete line
-                    line = line0withend
+            # Below the bound, split directly as readline always did (few, bounded
+            # passes). Past it, split only once the fresh span, prefixed with the
+            # previous span's last character, holds a boundary: see _has_line_boundary.
+            tail = parts[-1][-1:] if parts else ""
+            parts.append(new_chars)
+            buffered += len(new_chars)
+            if buffered <= _SPLIT_DIRECTLY_BELOW or _has_line_boundary(
+                tail + new_chars
+            ):
+                chars = "".join(parts)
+                lines = chars.splitlines(True)
+                if len(lines) > 1:
+                    line = lines[0]
+                    self.linebuffer = lines[1:]
+                    self._rewind_numchars = len(new_chars) - (len(chars) - len(line))
+                    self._rewind_checkpoint = startpos
                     break
+                elif len(lines) == 1:
+                    line0withend = lines[0]
+                    line0withoutend = lines[0].splitlines(False)[0]
+                    if line0withend != line0withoutend:  # complete line
+                        line = line0withend
+                        break
 
             if not new_chars or size is not None:
-                line = chars
+                line = "".join(parts)
                 break
 
             # Read successively larger blocks of text.
@@ -2029,6 +2150,10 @@ class SeekableUnicodeStreamReader:
             bytes that will be needed to move forward by ``offset`` chars.
             Defaults to ``offset``.
         """
+        if offset < 0:
+            # the backtracking loop below never reaches a negative count and
+            # would spin forever: the caller's bookkeeping has gone wrong
+            raise ValueError("Negative offsets are not supported")
         if est_bytes is None:
             est_bytes = offset
         bytes = b""
@@ -2186,7 +2311,7 @@ class SeekableUnicodeStreamReader:
 
     def _check_bom(self):
         # Normalize our encoding name
-        enc = re.sub("[ -]", "", self.encoding.lower())
+        enc = redos.sub("[ -]", "", self.encoding.lower())
 
         # Look up our encoding in the BOM table.
         bom_info = self._BOM_TABLE.get(enc)

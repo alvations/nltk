@@ -7,9 +7,9 @@
 
 import functools
 import os
-import re
 import tempfile
 
+from nltk import redos
 from nltk.corpus.reader.util import concat
 from nltk.corpus.reader.xmldocs import XMLCorpusReader, XMLCorpusView
 
@@ -277,7 +277,12 @@ class XML_Tool:
     def __init__(self, root, filename):
         self._root = root
         self.read_file = os.path.join(root, filename)
-        self.write_file = tempfile.NamedTemporaryFile(delete=False)
+        # Imported here: nltk.data imports the corpus package.
+        from nltk.data import staging_tempdir
+
+        self.write_file = tempfile.NamedTemporaryFile(
+            delete=False, dir=staging_tempdir()
+        )
 
     def build_preprocessed_file(self):
         try:
@@ -293,15 +298,15 @@ class XML_Tool:
             line = " "
             while len(line):
                 line = fr.readline()
-                x = re.split(r"nkjp:[^ ]* ", line)  # in all files
+                x = redos.split(r"nkjp:[^ ]* ", line)  # in all files
                 ret = " ".join(x)
-                x = re.split("<nkjp:paren>", ret)  # in ann_segmentation.xml
+                x = redos.split("<nkjp:paren>", ret)  # in ann_segmentation.xml
                 ret = " ".join(x)
-                x = re.split("</nkjp:paren>", ret)  # in ann_segmentation.xml
+                x = redos.split("</nkjp:paren>", ret)  # in ann_segmentation.xml
                 ret = " ".join(x)
-                x = re.split("<choice>", ret)  # in ann_segmentation.xml
+                x = redos.split("<choice>", ret)  # in ann_segmentation.xml
                 ret = " ".join(x)
-                x = re.split("</choice>", ret)  # in ann_segmentation.xml
+                x = redos.split("</choice>", ret)  # in ann_segmentation.xml
                 ret = " ".join(x)
                 fw.write(ret)
             fr.close()

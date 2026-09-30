@@ -8,6 +8,7 @@
 
 import pickle
 import tempfile
+from collections import deque
 from copy import deepcopy
 from operator import itemgetter
 from os import remove
@@ -22,7 +23,8 @@ except ImportError:
 
 from nltk.parse import DependencyEvaluator, DependencyGraph, ParserI
 from nltk.pathsec import open as pathsec_open
-from nltk.picklesec import allowlisted_pickle_load
+from nltk.picklesec import allowlisted_pickle_load, pickle_dump
+from nltk.termsec import safe_print
 
 # A fitted SVC pickle needs only exact numpy/scipy/sklearn globals; whole
 # namespaces exposed real gadgets, so allowlist exact globals (CWE-502).
@@ -49,6 +51,47 @@ _MODEL_ALLOWED_GLOBALS = (
     ("builtins", "float"),
 )
 
+# The numpy ``scalar`` reconstructor is a nested-unpickle sink for an
+# object-bearing dtype (CWE-502); picklesec wraps it globally, so only the
+# allowlist above and the object-dtype refusal below are needed here.
+
+
+def _load_transitionparser_model(file):
+    """Load a transition parser model through the allowlisting unpickler, refusing
+    any object dtype numpy array / scalar via ``sanitize=`` (the ``scalar`` wrapper
+    already blocks the reconstruction-time nested unpickle) (CWE-502)."""
+    try:
+        import numpy as _np
+    except ImportError:  # numpy absent -> no numpy array in the graph to inspect
+        sanitize = None
+    else:
+
+        def sanitize(obj):
+            # A fitted SVC carries only numeric numpy arrays / scipy sparse; an
+            # object dtype array or scalar is never legitimate, so refuse it.
+            if isinstance(obj, _np.ndarray):
+                if obj.dtype.hasobject:
+                    raise pickle.UnpicklingError(
+                        "transition parser model holds an object dtype numpy array, "
+                        "which no fitted SVC produces; refusing (CWE-502)"
+                    )
+                return True  # numeric array leaf: do not descend into its elements
+            if isinstance(obj, _np.generic):
+                if obj.dtype.hasobject:
+                    raise pickle.UnpicklingError(
+                        "transition parser model holds an object dtype numpy scalar; "
+                        "refusing (CWE-502)"
+                    )
+                return True
+            return False
+
+    return allowlisted_pickle_load(
+        file,
+        allowed_globals=_MODEL_ALLOWED_GLOBALS,
+        allowed_modules=_MODEL_ALLOWED_MODULES,
+        sanitize=sanitize,
+    )
+
 
 class Configuration:
     """
@@ -71,7 +114,9 @@ class Configuration:
         """
         # dep_graph.nodes contain list of token for a sentence
         self.stack = [0]  # The root element
-        self.buffer = list(range(1, len(dep_graph.nodes)))  # The rest is in the buffer
+        # A deque lets shift/right-arc consume the front in O(1) (CWE-407);
+        # index/len/setitem semantics used elsewhere are unchanged.
+        self.buffer = deque(range(1, len(dep_graph.nodes)))  # The rest is in the buffer
         self.arcs = []  # empty set of arc
         self._tokens = dep_graph.nodes
         self._max_address = len(self.buffer)
@@ -81,7 +126,7 @@ class Configuration:
             "Stack : "
             + str(self.stack)
             + "  Buffer : "
-            + str(self.buffer)
+            + str(list(self.buffer))
             + "   Arcs : "
             + str(self.arcs)
         )
@@ -274,7 +319,7 @@ class Transition:
             conf.arcs.append((idx_wi, relation, idx_wj))
         else:  # arc-eager
             idx_wi = conf.stack[len(conf.stack) - 1]
-            idx_wj = conf.buffer.pop(0)
+            idx_wj = conf.buffer.popleft()
             conf.stack.append(idx_wj)
             conf.arcs.append((idx_wi, relation, idx_wj))
 
@@ -310,7 +355,7 @@ class Transition:
         """
         if len(conf.buffer) <= 0:
             return -1
-        idx_wi = conf.buffer.pop(0)
+        idx_wi = conf.buffer.popleft()
         conf.stack.append(idx_wi)
 
 
@@ -377,6 +422,10 @@ class TransitionParser(ParserI):
                 if parentIdx is not None:
                     arc_list.append((parentIdx, childIdx))
 
+        # Membership test against a set is O(1); testing the list was O(V) inside
+        # the triple loop below, making the whole check O(V**4) (CWE-770).
+        arc_set = set(arc_list)
+
         for parentIdx, childIdx in arc_list:
             # Ensure that childIdx < parentIdx
             if childIdx > parentIdx:
@@ -386,9 +435,9 @@ class TransitionParser(ParserI):
             for k in range(childIdx + 1, parentIdx):
                 for m in range(len(depgraph.nodes)):
                     if (m < childIdx) or (m > parentIdx):
-                        if (k, m) in arc_list:
+                        if (k, m) in arc_set:
                             return False
-                        if (m, k) in arc_list:
+                        if (m, k) in arc_set:
                             return False
         return True
 
@@ -460,8 +509,8 @@ class TransitionParser(ParserI):
                 operation.shift(conf)
                 training_seq.append(key)
 
-        print(" Number of training examples : " + str(len(depgraphs)))
-        print(" Number of valid (projective) examples : " + str(count_proj))
+        safe_print(" Number of training examples : " + str(len(depgraphs)))
+        safe_print(" Number of valid (projective) examples : " + str(count_proj))
         return training_seq
 
     def _create_training_examples_arc_eager(self, depgraphs, input_file):
@@ -524,8 +573,8 @@ class TransitionParser(ParserI):
                 operation.shift(conf)
                 training_seq.append(key)
 
-        print(" Number of training examples : " + str(len(depgraphs)))
-        print(" Number of valid (projective) examples : " + str(countProj))
+        safe_print(" Number of training examples : " + str(len(depgraphs)))
+        safe_print(" Number of valid (projective) examples : " + str(countProj))
         return training_seq
 
     def train(self, depgraphs, modelfile, verbose=True):
@@ -567,13 +616,11 @@ class TransitionParser(ParserI):
             )
 
             model.fit(x_train, y_train)
-            # Save the model to file name (as pickle). ``modelfile`` is a
-            # caller-supplied path, so route the write through the pathsec
-            # sandbox: an unauthorized destination is refused before any bytes
-            # are written, closing the arbitrary-path pickle write
-            # (GHSA-8mgp-746c-j5xp).
+            # Save the model as a pickle. modelfile is caller-supplied, so the
+            # write goes through the pathsec sandbox: an unauthorized destination
+            # is refused before any bytes are written (GHSA-8mgp-746c-j5xp).
             with pathsec_open(modelfile, "wb", context="TransitionParser.train") as f:
-                pickle.dump(model, f)
+                pickle_dump(model, f)
         finally:
             remove(input_file.name)
 
@@ -586,24 +633,19 @@ class TransitionParser(ParserI):
         :return: list (DependencyGraph) with the 'head' and 'rel' information
         """
         result = []
-        # First load the model. The model is a trained scikit-learn classifier,
-        # so it is loaded through an allowlisting unpickler (CWE-502): only the
-        # exact globals a fitted SVC pickle needs may be reconstructed, and
-        # anything else (e.g. os.system, or scipy.io.mmwrite) raises
-        # UnpicklingError instead of executing/writing. See
-        # nltk/picklesec.py and huntr report
-        # https://huntr.com/bounties/38abc191-0525-42a1-96fd-262c1c187012
+        # Load the model (a fitted scikit-learn SVC) through the allowlisting
+        # unpickler: only the globals a real SVC pickle needs may be rebuilt, so a
+        # planted os.system / scipy.io.mmwrite raises UnpicklingError (CWE-502).
         #
-        # ``modelFile`` is a caller-supplied path, so route the read through the
-        # pathsec sandbox too: an out-of-sandbox model path is refused before it
-        # is opened (GHSA-8mgp-746c-j5xp), and the resulting handle is still
-        # unpickled through the allowlisting unpickler.
+        # modelFile is caller-supplied, so the read goes through the pathsec
+        # sandbox first: an out-of-sandbox path is refused before it is opened
+        # (GHSA-8mgp-746c-j5xp).
+        #
+        # _load_transitionparser_model adds the numpy object-dtype refusal; see
+        # nltk/picklesec.py and the huntr report
+        # https://huntr.com/bounties/38abc191-0525-42a1-96fd-262c1c187012
         with pathsec_open(modelFile, "rb", context="TransitionParser.parse") as f:
-            model = allowlisted_pickle_load(
-                f,
-                allowed_modules=_MODEL_ALLOWED_MODULES,
-                allowed_globals=_MODEL_ALLOWED_GLOBALS,
-            )
+            model = _load_transitionparser_model(f)
         operation = Transition(self._algorithm)
 
         for depgraph in depgraphs:
@@ -658,19 +700,15 @@ class TransitionParser(ParserI):
 
                     if y_pred in self._match_transition:
                         strTransition = self._match_transition[y_pred]
-                        baseTransition = strTransition.split(":")[0]
+                        # Split on the first colon only: a relation label may
+                        # itself carry one (Universal Dependencies "nmod:poss").
+                        baseTransition, _, relation = strTransition.partition(":")
 
                         if baseTransition == Transition.LEFT_ARC:
-                            if (
-                                operation.left_arc(conf, strTransition.split(":")[1])
-                                != -1
-                            ):
+                            if operation.left_arc(conf, relation) != -1:
                                 break
                         elif baseTransition == Transition.RIGHT_ARC:
-                            if (
-                                operation.right_arc(conf, strTransition.split(":")[1])
-                                != -1
-                            ):
+                            if operation.right_arc(conf, relation) != -1:
                                 break
                         elif baseTransition == Transition.REDUCE:
                             if operation.reduce(conf) != -1:

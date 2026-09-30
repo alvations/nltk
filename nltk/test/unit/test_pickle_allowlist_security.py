@@ -193,14 +193,20 @@ def test_in_namespace_gadget_repp_blocked():
 
 
 def test_denied_module_backstop_even_if_allowlisted():
-    """Defense in depth: os.system / builtins.eval cannot be reconstructed even
-    if a future caller mistakenly allowlists their module or the exact global."""
-    up = AllowlistUnpickler(BytesIO(b""), allowed_modules=("os",))
+    """Defense in depth at two layers. First the boundary: a caller cannot even
+    CONFIGURE a loader that allowlists ``os`` or ``builtins.eval``: the
+    constructor validates the allowlist and refuses it before a byte is read."""
     with pytest.raises(pickle.UnpicklingError):
-        up.find_class("os", "system")
-    up2 = AllowlistUnpickler(BytesIO(b""), allowed_globals=(("builtins", "eval"),))
+        AllowlistUnpickler(BytesIO(b""), allowed_modules=("os",))
     with pytest.raises(pickle.UnpicklingError):
-        up2.find_class("builtins", "eval")
+        AllowlistUnpickler(BytesIO(b""), allowed_globals=(("builtins", "eval"),))
+    # And even if that boundary were bypassed, find_class still refuses os.system /
+    # builtins.eval on an unrelated (benign) allowlist: the runtime guard stands.
+    benign = AllowlistUnpickler(BytesIO(b""), allowed_globals=(("builtins", "int"),))
+    with pytest.raises(pickle.UnpicklingError):
+        benign.find_class("os", "system")
+    with pytest.raises(pickle.UnpicklingError):
+        benign.find_class("builtins", "eval")
 
 
 @pytest.mark.parametrize("module", ["posixpath", "ntpath", "genericpath"])
@@ -208,10 +214,15 @@ def test_os_path_backing_modules_are_denied(module, tmp_path):
     """GHSA-x99w: os.path is denied, but so must be the concrete modules it *is*
     on each platform; else a broad allow of posixpath/ntpath/genericpath would
     reach path/stat/expandvars gadgets (an env-var and filesystem oracle)."""
-    up = AllowlistUnpickler(BytesIO(b""), allowed_modules=(module,))
+    # Boundary: allowlisting the backing module is refused at construction.
     with pytest.raises(pickle.UnpicklingError, match="denied module"):
-        up.find_class(module, "exists")
-    # end-to-end: an expandvars REDUCE must not read the environment
+        AllowlistUnpickler(BytesIO(b""), allowed_modules=(module,))
+    # Runtime backstop: find_class on a benign loader still refuses it.
+    benign = AllowlistUnpickler(BytesIO(b""), allowed_globals=(("builtins", "int"),))
+    with pytest.raises(pickle.UnpicklingError, match="denied module"):
+        benign.find_class(module, "exists")
+    # end-to-end: an expandvars REDUCE must not read the environment. The load is
+    # now refused at configuration time (allowed_modules names a denied module).
     marker = "nltk-env-oracle-9ffx"
     os.environ["NLTK_PICKLE_CANARY"] = marker
     try:
@@ -1462,7 +1473,7 @@ def test_data_load_restricted_pickle_roundtrips_real_asset(tmp_path, monkeypatch
     assert loaded == staged_value, "staged real .pickle failed to load via data.load"
 
 
-def test_all_nltk_data_pickle_assets_load():
+def test_all_nltk_data_pickle_assets_load(tmp_path_factory):
     """Real-asset regression: EVERY ``*.pickle`` present in the installed nltk_data
     must still load through ``nltk.data.load`` after the picklesec hardening (class-
     bearing artifacts like punkt / perceptron / maxent via the pickle-free redirect;
@@ -1475,7 +1486,20 @@ def test_all_nltk_data_pickle_assets_load():
 
     import nltk
 
-    roots = [p for p in nltk.data.path if os.path.isdir(p)]
+    # conftest.py registers pytest's session basetemp as an nltk.data.path root so
+    # staging tests can write inside the pathsec sandbox. That base holds ephemeral
+    # scratch from other tests (symlinks, deliberately unloadable pickles), never
+    # real nltk_data assets, so exclude it and anything under it: this scanner
+    # validates installed assets, not per-test tmp files (a filename-based skip
+    # would be bypassed by any other extension, so exclude by location).
+    basetemp = os.path.realpath(str(tmp_path_factory.getbasetemp()))
+    roots = [
+        p
+        for p in nltk.data.path
+        if os.path.isdir(p)
+        and os.path.realpath(p) != basetemp
+        and not os.path.realpath(p).startswith(basetemp + os.sep)
+    ]
     files = []
     for root in roots:
         files += glob.glob(os.path.join(root, "**", "*.pickle"), recursive=True)
@@ -1498,6 +1522,67 @@ def test_all_nltk_data_pickle_assets_load():
     assert not broken, "nltk_data pickle assets failed to load:\n  " + "\n  ".join(
         broken
     )
+
+
+@pytest.mark.parametrize(
+    "reduce_fn",
+    [
+        lambda m: (os.system, (f"touch {m}",)),
+        lambda m: (eval, (f"__import__('os').system('touch {m}')",)),
+        lambda m: (__import__("subprocess").call, (["touch", str(m)],)),
+    ],
+)
+def test_gadget_pickle_under_authorized_root_is_refused_at_load(
+    tmp_path, monkeypatch, reduce_fn
+):
+    """Excluding the pytest basetemp from the asset scanner is not a security hole.
+
+    The scanner is a real-asset regression test, not the load-time defense. A
+    gadget pickle placed inside a *trusted* (conftest-authorized) data root is
+    still refused by nltk.data.load's restricted unpickler, which fires on every
+    load regardless of location, so nothing executes (CWE-502).
+    """
+    import pickle
+
+    import nltk
+    import nltk.data as _data
+    from nltk import pathsec
+
+    marker = tmp_path / "PWNED"
+
+    class _Gadget:
+        def __reduce__(self):
+            return reduce_fn(marker)
+
+    (tmp_path / "corpora").mkdir()
+    with open(tmp_path / "corpora" / "gadget.pickle", "wb") as handle:
+        pickle.dump(_Gadget(), handle)
+    monkeypatch.setattr(_data, "path", [str(tmp_path), *_data.path])
+    monkeypatch.setattr(pathsec, "_ALLOWED_ROOTS_CACHE", None, raising=False)
+    monkeypatch.setattr(pathsec, "_LAST_DATA_PATHS", None, raising=False)
+
+    with pytest.raises(Exception) as exc:
+        nltk.data.load("corpora/gadget.pickle")
+    assert "forbidden" in str(exc.value).lower()
+    assert not marker.exists()
+
+
+def test_scanner_excludes_only_the_pytest_base_not_siblings_or_real_roots(
+    tmp_path_factory,
+):
+    """The scanner's basetemp exclusion is precise and by location: only the base
+    and its subtree are dropped, so a sibling sharing the name prefix and the real
+    asset roots are still scanned -- no over-exclusion blind spot."""
+    base = os.path.realpath(str(tmp_path_factory.getbasetemp()))
+
+    def _excluded(p):
+        rp = os.path.realpath(p)
+        return rp == base or rp.startswith(base + os.sep)
+
+    assert _excluded(base)  # the ephemeral base itself
+    assert _excluded(os.path.join(base, "sub", "worker0"))  # scratch under it
+    assert not _excluded(base + "-real")  # sibling prefix -> still scanned
+    assert not _excluded("/usr/share/nltk_data")  # a real asset root -> still scanned
 
 
 # Module (sub)trees where EVERY callable is a code-exec / file / native /

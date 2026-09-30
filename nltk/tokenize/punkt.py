@@ -114,11 +114,13 @@ from collections.abc import Iterator
 from re import Match
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from nltk import redos
 from nltk.pathsec import open as pathsec_open
 from nltk.pathsec import validate_path
 from nltk.picklesec import allowlisted_pickle_load
 from nltk.probability import FreqDist
 from nltk.tabdata import TabEncoder
+from nltk.termsec import safe_print
 from nltk.tokenize.api import TokenizerI
 
 # Exact ``(module, qualname)`` allowlist -- no namespace prefix. A prefix allow
@@ -263,7 +265,7 @@ class PunktLanguageVars:
     # quotes, so a sentence-final curly/guillemet quote is realigned onto the
     # sentence it follows. NLTKWordTokenizer (nltk/tokenize/destructive.py)
     # already handles this same set (STARTING_QUOTES / ENDING_QUOTES, gh-1682).
-    re_boundary_realignment = re.compile(
+    re_boundary_realignment = redos.compile(
         r'["\')\]}\u2018\u2019\u201c\u201d\xab\xbb]+?(?:\s+|(?=--)|$)',
         re.MULTILINE,
     )
@@ -308,7 +310,7 @@ class PunktLanguageVars:
         try:
             return self._re_word_tokenizer
         except AttributeError:
-            self._re_word_tokenizer = re.compile(
+            self._re_word_tokenizer = redos.compile(
                 self._word_tokenize_fmt
                 % {
                     "NonWord": self._re_non_word_chars,
@@ -340,7 +342,7 @@ class PunktLanguageVars:
         try:
             return self._re_period_context
         except AttributeError:
-            self._re_period_context = re.compile(
+            self._re_period_context = redos.compile(
                 self._period_context_fmt
                 % {
                     "NonWord": self._re_non_word_chars,
@@ -351,7 +353,7 @@ class PunktLanguageVars:
             return self._re_period_context
 
 
-_re_non_punct = re.compile(r"[^\W\d]", re.UNICODE)
+_re_non_punct = redos.compile(r"[^\W\d]", re.UNICODE)
 """Matches token types that are not merely punctuation. (Types for
 numeric tokens are changed to ##number## and hence contain alpha.)"""
 
@@ -467,10 +469,10 @@ class PunktToken:
     # { Regular expressions for properties
     # ////////////////////////////////////////////////////////////
     # Note: [A-Za-z] is approximated by [^\W\d] in the general case.
-    _RE_ELLIPSIS = re.compile(r"\.\.+$")
-    _RE_NUMERIC = re.compile(r"^-?[\.,]?\d[\d,\.-]*\.?$")
-    _RE_INITIAL = re.compile(r"[^\W\d]\.$", re.UNICODE)
-    _RE_ALPHA = re.compile(r"[^\W\d]+$", re.UNICODE)
+    _RE_ELLIPSIS = redos.compile(r"\.\.+$")
+    _RE_NUMERIC = redos.compile(r"^-?[\.,]?\d[\d,\.-]*\.?$")
+    _RE_INITIAL = redos.compile(r"[^\W\d]\.$", re.UNICODE)
+    _RE_ALPHA = redos.compile(r"[^\W\d]+$", re.UNICODE)
 
     # ////////////////////////////////////////////////////////////
     # { Derived properties
@@ -825,12 +827,12 @@ class PunktTrainer(PunktBaseClass):
                 if is_add:
                     self._params.abbrev_types.add(abbr)
                     if verbose:
-                        print(f"  Abbreviation: [{score:6.4f}] {abbr}")
+                        safe_print(f"  Abbreviation: [{score:6.4f}] {abbr}")
             else:
                 if not is_add:
                     self._params.abbrev_types.remove(abbr)
                     if verbose:
-                        print(f"  Removed abbreviation: [{score:6.4f}] {abbr}")
+                        safe_print(f"  Removed abbreviation: [{score:6.4f}] {abbr}")
 
         # Make a preliminary pass through the document, marking likely
         # sentence breaks, abbreviations, and ellipsis tokens.
@@ -853,7 +855,7 @@ class PunktTrainer(PunktBaseClass):
             if self._is_rare_abbrev_type(aug_tok1, aug_tok2):
                 self._params.abbrev_types.add(aug_tok1.type_no_period)
                 if verbose:
-                    print("  Rare Abbrev: %s" % aug_tok1.type)
+                    safe_print("  Rare Abbrev: %s" % aug_tok1.type)
 
             # Does second token have a high likelihood of starting a sentence?
             if self._is_potential_sent_starter(aug_tok2, aug_tok1):
@@ -877,13 +879,13 @@ class PunktTrainer(PunktBaseClass):
         for typ, log_likelihood in self._find_sent_starters():
             self._params.sent_starters.add(typ)
             if verbose:
-                print(f"  Sent Starter: [{log_likelihood:6.4f}] {typ!r}")
+                safe_print(f"  Sent Starter: [{log_likelihood:6.4f}] {typ!r}")
 
         self._params.clear_collocations()
         for (typ1, typ2), log_likelihood in self._find_collocations():
             self._params.collocations.add((typ1, typ2))
             if verbose:
-                print(f"  Collocation: [{log_likelihood:6.4f}] {typ1!r}+{typ2!r}")
+                safe_print(f"  Collocation: [{log_likelihood:6.4f}] {typ1!r}+{typ2!r}")
 
         self._finalized = True
 
@@ -1426,18 +1428,18 @@ class PunktSentenceTokenizer(PunktBaseClass, TokenizerI):
 
             >>> pst = PunktSentenceTokenizer()
             >>> text = "Very bad acting!!! I promise."
-            >>> list(pst._lang_vars.period_context_re().finditer(text)) # doctest: +NORMALIZE_WHITESPACE
-            [<re.Match object; span=(15, 16), match='!'>,
-            <re.Match object; span=(16, 17), match='!'>,
-            <re.Match object; span=(17, 18), match='!'>]
+            >>> list(pst._lang_vars.period_context_re().finditer(text)) # doctest: +NORMALIZE_WHITESPACE +ELLIPSIS
+            [<...Match object; span=(15, 16), match='!'>,
+            <...Match object; span=(16, 17), match='!'>,
+            <...Match object; span=(17, 18), match='!'>]
 
         So, we need to find the word before the match from right to left, and then manually remove
         the overlaps. That is what this method does::
 
             >>> pst = PunktSentenceTokenizer()
             >>> text = "Very bad acting!!! I promise."
-            >>> list(pst._match_potential_end_contexts(text))
-            [(<re.Match object; span=(17, 18), match='!'>, 'acting!!! I')]
+            >>> list(pst._match_potential_end_contexts(text)) # doctest: +ELLIPSIS
+            [(<...Match object; span=(17, 18), match='!'>, 'acting!!! I')]
 
         :param text: String of one or more sentences
         :type text: str
@@ -1599,7 +1601,7 @@ class PunktSentenceTokenizer(PunktBaseClass, TokenizerI):
         pos = 0
 
         # A regular expression that finds pieces of whitespace:
-        white_space_regexp = re.compile(r"\s*")
+        white_space_regexp = redos.compile(r"\s*")
 
         sentence = ""
         for aug_tok in tokens:
@@ -1616,7 +1618,7 @@ class PunktSentenceTokenizer(PunktBaseClass, TokenizerI):
             # If so, then use the version with whitespace.
             if text[pos : pos + len(tok)] != tok:
                 pat = r"\s*".join(re.escape(c) for c in tok)
-                m = re.compile(pat).match(text, pos)
+                m = redos.compile(pat).match(text, pos)
                 if m:
                     tok = m.group()
 
@@ -1649,7 +1651,7 @@ class PunktSentenceTokenizer(PunktBaseClass, TokenizerI):
         outfilename = os.path.join(
             make_staging_dir(prefix="nltk_punkt_dump_"), "punkt.new"
         )
-        print(f"writing to {outfilename}...")
+        safe_print(f"writing to {outfilename}...")
         with pathsec_open(
             outfilename, "w", context="PunktSentenceTokenizer.dump"
         ) as outfile:
@@ -1936,11 +1938,13 @@ def format_debug_decision(d):
 def demo(text, tok_cls=PunktSentenceTokenizer, train_cls=PunktTrainer):
     """Builds a punkt model and applies it to the same text"""
     cleanup = (
-        lambda s: re.compile(r"(?:\r|^\s+)", re.MULTILINE).sub("", s).replace("\n", " ")
+        lambda s: redos.compile(r"(?:\r|^\s+)", re.MULTILINE)
+        .sub("", s)
+        .replace("\n", " ")
     )
     trainer = train_cls()
     trainer.INCLUDE_ALL_COLLOCS = True
     trainer.train(text)
     sbd = tok_cls(trainer.get_params())
     for sentence in sbd.sentences_from_text(text):
-        print(cleanup(sentence))
+        safe_print(cleanup(sentence))

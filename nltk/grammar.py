@@ -72,9 +72,11 @@ import re
 from collections import deque
 from functools import total_ordering
 
+from nltk import redos
 from nltk.featstruct import SLASH, TYPE, FeatDict, FeatStruct, FeatStructReader
 from nltk.internals import raise_unorderable_types
 from nltk.probability import ImmutableProbabilisticMixIn
+from nltk.termsec import safe_print
 from nltk.util import invert_graph, transitive_closure
 
 #################################################################
@@ -1365,10 +1367,10 @@ def _read_fcfg_production(input, fstruct_reader):
 
 # Parsing generic grammars
 
-_ARROW_RE = re.compile(r"\s* -> \s*", re.VERBOSE)
-_PROBABILITY_RE = re.compile(r"( \[ [\d\.]+ \] ) \s*", re.VERBOSE)
-_TERMINAL_RE = re.compile(r'( "[^"]*" | \'[^\']*\' ) \s*', re.VERBOSE)
-_DISJUNCTION_RE = re.compile(r"\| \s*", re.VERBOSE)
+_ARROW_RE = redos.compile(r"\s* -> \s*", re.VERBOSE)
+_PROBABILITY_RE = redos.compile(r"( \[ [\d\.]+ \] ) \s*", re.VERBOSE)
+_TERMINAL_RE = redos.compile(r'( "[^"]*" | \'[^\']*\' ) \s*', re.VERBOSE)
+_DISJUNCTION_RE = redos.compile(r"\| \s*", re.VERBOSE)
 
 
 def _read_production(line, nonterm_parser, probabilistic=False):
@@ -1491,7 +1493,7 @@ def read_grammar(input, nonterm_parser, probabilistic=False, encoding=None):
     return (start, productions)
 
 
-_STANDARD_NONTERM_RE = re.compile(r"( [\w/][\w/^<>-]* ) \s*", re.VERBOSE)
+_STANDARD_NONTERM_RE = redos.compile(r"( [\w/][\w/^<>-]* ) \s*", re.VERBOSE)
 
 
 def standard_nonterm_parser(string, pos):
@@ -1505,7 +1507,7 @@ def standard_nonterm_parser(string, pos):
 # Reading Dependency Grammars
 #################################################################
 
-_READ_DG_RE = re.compile(
+_READ_DG_RE = redos.compile(
     r"""^\s*                # leading whitespace
                               ('[^']+')\s*        # single-quoted lhs
                               (?:[-=]+>)\s*        # arrow
@@ -1518,7 +1520,7 @@ _READ_DG_RE = re.compile(
                                  *$""",  # zero or more copies
     re.VERBOSE,
 )
-_SPLIT_DG_RE = re.compile(r"""('[^']'|[-=]+>|"[^"]+"|'[^']+'|\|)""")
+_SPLIT_DG_RE = redos.compile(r"""('[^']'|[-=]+>|"[^"]+"|'[^']+'|\|)""")
 
 
 def _read_dependency_production(s):
@@ -1553,11 +1555,11 @@ def cfg_demo():
     N, V, P, Det = nonterminals("N, V, P, Det")
     VP_slash_NP = VP / NP
 
-    print("Some nonterminals:", [S, NP, VP, PP, N, V, P, Det, VP / NP])
-    print("    S.symbol() =>", repr(S.symbol()))
-    print()
+    safe_print("Some nonterminals:", [S, NP, VP, PP, N, V, P, Det, VP / NP])
+    safe_print("    S.symbol() =>", repr(S.symbol()))
+    safe_print()
 
-    print(Production(S, [NP]))
+    safe_print(Production(S, [NP]))
 
     # Create some Grammar Productions
     grammar = CFG.fromstring(
@@ -1573,12 +1575,12 @@ def cfg_demo():
     """
     )
 
-    print("A Grammar:", repr(grammar))
-    print("    grammar.start()       =>", repr(grammar.start()))
-    print("    grammar.productions() =>", end=" ")
+    safe_print("A Grammar:", repr(grammar))
+    safe_print("    grammar.start()       =>", repr(grammar.start()))
+    safe_print("    grammar.productions() =>", end=" ")
     # Use string.replace(...) is to line-wrap the output.
-    print(repr(grammar.productions()).replace(",", ",\n" + " " * 25))
-    print()
+    safe_print(repr(grammar.productions()).replace(",", ",\n" + " " * 25))
+    safe_print()
 
 
 def pcfg_demo():
@@ -1634,22 +1636,22 @@ def pcfg_demo():
     pcfg_prods = toy_pcfg1.productions()
 
     pcfg_prod = pcfg_prods[2]
-    print("A PCFG production:", repr(pcfg_prod))
-    print("    pcfg_prod.lhs()  =>", repr(pcfg_prod.lhs()))
-    print("    pcfg_prod.rhs()  =>", repr(pcfg_prod.rhs()))
-    print("    pcfg_prod.prob() =>", repr(pcfg_prod.prob()))
-    print()
+    safe_print("A PCFG production:", repr(pcfg_prod))
+    safe_print("    pcfg_prod.lhs()  =>", repr(pcfg_prod.lhs()))
+    safe_print("    pcfg_prod.rhs()  =>", repr(pcfg_prod.rhs()))
+    safe_print("    pcfg_prod.prob() =>", repr(pcfg_prod.prob()))
+    safe_print()
 
     grammar = toy_pcfg2
-    print("A PCFG grammar:", repr(grammar))
-    print("    grammar.start()       =>", repr(grammar.start()))
-    print("    grammar.productions() =>", end=" ")
+    safe_print("A PCFG grammar:", repr(grammar))
+    safe_print("    grammar.start()       =>", repr(grammar.start()))
+    safe_print("    grammar.productions() =>", end=" ")
     # Use .replace(...) is to line-wrap the output.
-    print(repr(grammar.productions()).replace(",", ",\n" + " " * 26))
-    print()
+    safe_print(repr(grammar.productions()).replace(",", ",\n" + " " * 26))
+    safe_print()
 
     # extract productions from three trees and induce the PCFG
-    print("Induce PCFG grammar from treebank data:")
+    safe_print("Induce PCFG grammar from treebank data:")
 
     productions = []
     item = treebank._fileids[0]
@@ -1662,10 +1664,10 @@ def pcfg_demo():
 
     S = Nonterminal("S")
     grammar = induce_pcfg(S, productions)
-    print(grammar)
-    print()
+    safe_print(grammar)
+    safe_print()
 
-    print("Parse sentence using induced grammar:")
+    safe_print("Parse sentence using induced grammar:")
 
     parser = pchart.InsideChartParser(grammar)
     parser.trace(3)
@@ -1674,17 +1676,17 @@ def pcfg_demo():
     # sent = treebank.tokenized('wsj_0001.mrg')[0]
 
     sent = treebank.parsed_sents(item)[0].leaves()
-    print(sent)
+    safe_print(sent)
     for parse in parser.parse(sent):
-        print(parse)
+        safe_print(parse)
 
 
 def fcfg_demo():
     import nltk.data
 
     g = nltk.data.load("grammars/book_grammars/feat0.fcfg")
-    print(g)
-    print()
+    safe_print(g)
+    safe_print()
 
 
 def dg_demo():
@@ -1699,7 +1701,7 @@ def dg_demo():
     'cats' -> 'the'
     """
     )
-    print(grammar)
+    safe_print(grammar)
 
 
 def sdg_demo():
@@ -1727,7 +1729,7 @@ def sdg_demo():
     """
     )
     tree = dg.tree()
-    print(tree.pprint())
+    safe_print(tree.pprint())
 
 
 def demo():

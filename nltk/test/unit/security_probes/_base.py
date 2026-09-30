@@ -68,6 +68,24 @@ def within_budget(func, budget=DOS_BUDGET, repeats=3):
     return best < budget, best
 
 
+def scaling_ratio(op, small, big, reps=3, noise_floor=0.1):
+    """Fastest-of-``reps`` ``op(big)`` over ``op(small)`` (``big`` == 4*``small``).
+
+    A load-invariant scaling factor, mirroring the DoS regression harness: a
+    linear sink is ~4x, a pre-patch O(n**2) sink ~16x. The floor is
+    multiplicative so a sub-second quadratic is not hidden by additive slack,
+    and each side is a min-of-``reps`` to shed a transient scheduler stall.
+    """
+    t_small = min(timed(op, small) for _ in range(reps))
+    t_big = min(timed(op, big) for _ in range(reps))
+    return t_big / max(t_small, noise_floor)
+
+
+#: A scaling factor at or above this reads as super-linear (quadratic ~16x);
+#: a linear sink stays near 4x, so the gap is wide on any machine.
+QUADRATIC_RATIO = 8.0
+
+
 def read_source(dotted_module):
     """Source of an importable NLTK module, via its own ``__file__``.
 
@@ -113,6 +131,43 @@ _SECURITY_MARKERS = (
     "must be relative",
     "unsafe",
 )
+
+
+def _restore_data_path(saved):
+    """Undo any register_data_root() calls by restoring a saved nltk.data.path."""
+    import nltk.data
+    from nltk import pathsec
+
+    nltk.data.path[:] = saved
+    pathsec._ALLOWED_ROOTS_CACHE = None
+    pathsec._LAST_DATA_PATHS = None
+
+
+def register_data_root(root):
+    """Register *root* as an nltk.data root and return an undo callable.
+
+    A CorpusReader validates its root at __init__ against the pathsec data roots.
+    On Linux tempfile.mkdtemp() lands in /tmp, which is NOT a data root (it is
+    world-writable), so a probe that builds its corpus fixture there cannot even
+    construct the reader and errors before exercising the escape guard. On macOS
+    the private temp dir IS a root, which hid this. Registering the fixture root
+    reflects how a real corpus lives -- inside a data root -- so the reader
+    constructs and the traversal/symlink escapes are what actually get tested.
+    """
+    import nltk.data
+    from nltk import pathsec
+
+    saved = list(nltk.data.path)
+    nltk.data.path.insert(0, root)
+    pathsec._ALLOWED_ROOTS_CACHE = None
+    pathsec._LAST_DATA_PATHS = None
+
+    def _undo():
+        nltk.data.path[:] = saved
+        pathsec._ALLOWED_ROOTS_CACHE = None
+        pathsec._LAST_DATA_PATHS = None
+
+    return _undo
 
 
 def is_security_rejection(exc):

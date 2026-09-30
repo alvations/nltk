@@ -32,12 +32,20 @@ References:
   In HLT-NAACL. pp. 308-316.
 """
 
-import re
 import warnings
 from string import punctuation
 
+from nltk import redos
+from nltk.termsec import sanitize_terminal
 from nltk.tokenize.api import TokenizerI
 from nltk.util import ngrams
+
+# Upper bound on distinct fallback "vowel" characters accumulated across tokens.
+# assign_values() treats every unknown char as a vowel and remembers it on the
+# instance; without a cap an attacker-controlled stream of distinct codepoints
+# grows self.vowels without limit until the joined pattern trips redos's
+# MAX_PATTERN_LENGTH refusal. Far above any real phoneme inventory (< 100).
+_MAX_VOWEL_CHARS = 1024
 
 
 class SyllableTokenizer(TokenizerI):
@@ -101,10 +109,13 @@ class SyllableTokenizer(TokenizerI):
                 if c not in "0123456789" and c not in punctuation:
                     warnings.warn(
                         "Character not defined in sonority_hierarchy,"
-                        " assigning as vowel: '{}'".format(c)
+                        " assigning as vowel: '{}'".format(sanitize_terminal(c))
                     )
                     syllables_values.append((c, max(self.phoneme_map.values())))
-                    if c not in self.vowels:
+                    # Remember the char as a vowel, but stop growing the set past
+                    # the cap so the pattern built from it in validate_syllables
+                    # stays bounded (CWE-400 / CWE-407).
+                    if c not in self.vowels and len(self.vowels) < _MAX_VOWEL_CHARS:
                         self.vowels += c
                 else:  # If it's a punctuation or numbers, assign -1.
                     syllables_values.append((c, -1))
@@ -123,7 +134,8 @@ class SyllableTokenizer(TokenizerI):
         """
         valid_syllables = []
         front = ""
-        vowel_pattern = re.compile("|".join(self.vowels))
+        vowel_source = "|".join(self.vowels)
+        vowel_pattern = redos.compile(vowel_source)  # bounds compile + match time
         for i, syllable in enumerate(syllable_list):
             if syllable in punctuation:
                 valid_syllables.append(syllable)
