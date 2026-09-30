@@ -406,7 +406,8 @@ Walk through the noun synsets looking at their hypernyms:
     Synset('thing.n.12') [Synset('physical_entity.n.01')]
     Synset('object.n.01') [Synset('physical_entity.n.01')]
 
-Issue 3399: When specifying pos="a", both head adjectives and adjective satellites are returned.
+Issue 3399: When specifying pos="a", both head adjectives and adjective
+satellites are returned.
 
     >>> from nltk.corpus import wordnet as wn
     >>> # All adjective synsets (heads and satellites) for "good"
@@ -636,7 +637,8 @@ Issue 629: wordnet failures when python run with -O optimizations
     >>> wn.synsets("brunch")
     [Synset('brunch.n.01'), Synset('brunch.v.01')]
 
-Issue 395: wordnet returns incorrect result for lowest_common_hypernyms of chef and policeman
+Issue 395: wordnet returns incorrect result for lowest_common_hypernyms of
+chef and policeman
 
     >>> wn.synset('policeman.n.01').lowest_common_hypernyms(
     ...     wn.synset('chef.n.01'))
@@ -701,9 +703,9 @@ Endlessness vs. intractability in relation trees
 1. Endlessness
 --------------
 
-Until NLTK v. 3.5, the ``tree()`` function looped forever on symmetric relations
-(verb_groups, attributes, and most also_sees). But in the current version,
-``tree()`` now detects and discards these cycles:
+Until NLTK v. 3.5, the ``tree()`` function looped forever on symmetric
+relations (verb_groups, attributes, and most also_sees). But in the
+current version, ``tree()`` now detects and discards these cycles:
 
     >>> from pprint import pprint
     >>> pprint(wn.synset('bound.a.01').tree(lambda s:sorted(s.also_sees())))
@@ -819,9 +821,9 @@ cycles are mentioned in the output, together with the level where they occur:
 ..........................
 
 A Minimum Spanning Tree (MST) spans all the nodes of a relation subgraph once,
-while guaranteeing that each node is reached through the shortest path possible.
-In unweighted relation graphs like WordNet, a MST can be computed very
-efficiently in linear time, using Breadth-First Search (BFS). Like
+while guaranteeing that each node is reached through the shortest path
+possible. In unweighted relation graphs like WordNet, a MST can be computed
+very efficiently in linear time, using Breadth-First Search (BFS). Like
 acyclic_tree(), the new ``unweighted_minimum_spanning_tree()`` function
 (imported in the Wordnet module as ``mst``) handles intractable trees, such as
 the example discussed above:
@@ -900,7 +902,9 @@ since nltk_data does not include it.
       LazyCorpusLoader(
           "oewn2023",
           WordNetCorpusReader,
-          LazyCorpusLoader("omw-2.0", CorpusReader, r".*/wn-data-.*\.tab", encoding="utf8"),
+          LazyCorpusLoader(
+              "omw-2.0", CorpusReader, r".*/wn-data-.*\.tab", encoding="utf8"
+          ),
       )
 
 4. Enjoy:
