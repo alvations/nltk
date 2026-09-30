@@ -41,6 +41,19 @@ from nltk.tree import Tree
 MAX_DEPTH = 200
 
 
+def _dependent_addresses(node):
+    """The addresses a node's ``deps`` point at, whichever shape ``deps`` has.
+
+    Every graph the parsers build stores ``deps`` as a relation to addresses
+    mapping, so iterating it yields relation labels, not nodes; a plain list
+    of addresses is the legacy shape the ``contains_cycle`` doctest keeps.
+    """
+    deps = node["deps"]
+    if isinstance(deps, dict):
+        return chain.from_iterable(deps.values())
+    return deps
+
+
 class DependencyGraph:
     """
     A container for the nodes and labelled edges of a dependency structure.
@@ -110,13 +123,15 @@ class DependencyGraph:
         to the redirect node address.
         """
         for node in self.nodes.values():
-            new_deps = []
-            for dep in node["deps"]:
-                if dep in originals:
-                    new_deps.append(redirect)
-                else:
-                    new_deps.append(dep)
-            node["deps"] = new_deps
+            deps = node["deps"]
+            if isinstance(deps, dict):
+                # keep the relation to addresses mapping; only the targets move
+                for relation, addresses in deps.items():
+                    deps[relation] = [
+                        redirect if dep in originals else dep for dep in addresses
+                    ]
+            else:
+                node["deps"] = [redirect if dep in originals else dep for dep in deps]
 
     def add_arc(self, head_address, mod_address):
         """
@@ -556,17 +571,9 @@ class DependencyGraph:
         # and quintic on a list-``deps`` graph -- versus O(V + E) here, which
         # let a single oversized graph exhaust CPU (CWE-407).
         #
-        # ``deps`` may be a list of addresses or a relation->addresses
-        # mapping. Normalize mappings to their address values so the DFS does
-        # not mistake relation labels for graph nodes. The membership guard
-        # skips targets that are not nodes and avoids materialising spurious
-        # ``defaultdict`` entries in ``self.nodes``.
-        def iter_dependencies(node):
-            dependencies = node["deps"]
-            if isinstance(dependencies, dict):
-                return chain.from_iterable(dependencies.values())
-            return dependencies
-
+        # The edges come from _dependent_addresses, never from iterating
+        # ``deps`` itself. The membership guard skips targets that are not
+        # nodes without materialising spurious ``defaultdict`` entries.
         WHITE, GRAY, BLACK = 0, 1, 2
         color = defaultdict(int)  # int() == WHITE
 
@@ -575,7 +582,7 @@ class DependencyGraph:
                 continue
             color[start] = GRAY
             path = [start]
-            stack = [iter(iter_dependencies(self.nodes[start]))]
+            stack = [iter(_dependent_addresses(self.nodes[start]))]
             while stack:
                 for dep in stack[-1]:
                     if dep not in self.nodes:
@@ -587,7 +594,7 @@ class DependencyGraph:
                     if color[dep] == WHITE:
                         color[dep] = GRAY
                         path.append(dep)
-                        stack.append(iter(iter_dependencies(self.nodes[dep])))
+                        stack.append(iter(_dependent_addresses(self.nodes[dep])))
                         break
                 else:
                     color[path.pop()] = BLACK
@@ -602,10 +609,10 @@ class DependencyGraph:
             raise ValueError(
                 f"DependencyGraph.get_cycle_path() exceeded MAX_DEPTH={max_depth}."
             )
-        for dep in curr_node["deps"]:
+        for dep in _dependent_addresses(curr_node):
             if dep == goal_node_index:
                 return [curr_node["address"]]
-        for dep in curr_node["deps"]:
+        for dep in _dependent_addresses(curr_node):
             path = self.get_cycle_path(
                 self.get_by_address(dep), goal_node_index, _depth + 1, max_depth
             )
