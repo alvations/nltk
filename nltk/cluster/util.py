@@ -45,6 +45,14 @@ class VectorSpaceClusterer(ClusterI):
         as given, so it matches what ``classify`` returns for it afterwards.
         """
         assert len(vectors) > 0
+        # A NaN or infinite component makes the k-means and EM loops compare a
+        # distance or likelihood that never drops below the threshold, so they
+        # would never return; refuse it before fitting.
+        for vector in vectors:
+            if not numpy.isfinite(vector).all():
+                raise ValueError(
+                    "vectors must be finite: a NaN or infinite component never converges"
+                )
         original_vectors = vectors
 
         # normalise the vectors
@@ -118,7 +126,10 @@ class VectorSpaceClusterer(ClusterI):
         """
         Normalises the vector to unit length.
         """
-        return vector / sqrt(numpy.dot(vector, vector))
+        length = sqrt(numpy.dot(vector, vector))
+        if not length > 0:
+            raise ValueError("cannot normalise a zero vector")
+        return vector / length
 
 
 def euclidean_distance(u, v):
