@@ -73,9 +73,10 @@ def test_cluster_assignments_after_preprocessing(
 
 
 @pytest.mark.parametrize("normalise", [False, True])
-def test_gaa_cluster_assignments(normalise):
+@pytest.mark.parametrize("svd_dimensions", [None, 1])
+def test_gaa_cluster_assignments(normalise, svd_dimensions):
     vectors = np.array([[3.0, 1.0], [4.0, 1.0], [-3.0, -1.0], [-4.0, -1.0]])
-    clusterer = GAAClusterer(2, normalise=normalise)
+    clusterer = GAAClusterer(2, normalise=normalise, svd_dimensions=svd_dimensions)
 
     assignments = clusterer.cluster(vectors, assign_clusters=True)
 
@@ -83,6 +84,9 @@ def test_gaa_cluster_assignments(normalise):
     assert assignments[0] == assignments[1]
     assert assignments[2] == assignments[3]
     assert assignments[0] != assignments[2]
+    # the centroids live in the space classify() maps a query into
+    width = svd_dimensions or vectors.shape[1]
+    assert all(centroid.shape == (width,) for centroid in clusterer._centroids)
 
 
 @pytest.mark.parametrize("svd_dimensions", [None, 2])

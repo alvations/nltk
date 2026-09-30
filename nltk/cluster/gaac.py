@@ -102,15 +102,12 @@ class GAAClusterer(VectorSpaceClusterer):
         self._centroids = []
         for cluster in clusters:
             assert len(cluster) > 0
-            if self._should_normalise:
-                centroid = self._normalise(cluster[0])
-            else:
-                centroid = numpy.array(cluster[0])
+            # The dendrogram keeps the vectors as given; a centroid is the mean
+            # of them after the normalisation and SVD reduction the merges ran
+            # on, the space classify() maps a query into.
+            centroid = numpy.array(self.vector(cluster[0]), numpy.float64)
             for vector in cluster[1:]:
-                if self._should_normalise:
-                    centroid += self._normalise(vector)
-                else:
-                    centroid += vector
+                centroid += self.vector(vector)
             centroid /= len(cluster)
             self._centroids.append(centroid)
         self._num_clusters = len(self._centroids)
