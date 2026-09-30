@@ -17,8 +17,10 @@ import os
 import re
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
+import unicodedata
 import urllib.request
 import warnings
 import zipfile
@@ -27,6 +29,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from nltk import redos
+from nltk.termsec import sanitize_terminal
 
 # A URL is not a filesystem path: to the kernel "http://.." is the dir "http:"
 # then a ".." traversal. Anchored, whitespace-tolerant, case-insensitive match.
@@ -57,27 +60,96 @@ _WINDOWS_DEVICE_NAMES = frozenset(
 )
 
 
+_MAX_LINK_HOPS = 40  # ELOOP-style bound on symlink chains
+
+#: Ceiling for a model/data file handed to an external tool via
+#: :func:`validate_tool_path` with ``max_bytes=MAX_TOOL_MODEL_BYTES``. A file in a
+#: data root is already regular (no FIFO/device/symlink), but the tool loads its
+#: whole content into memory; an attacker who can plant a file in a root could
+#: otherwise ship a multi-gigabyte model to exhaust memory in the tool's parser
+#: (CWE-400/CWE-1333). 512 MiB is far above any real POS/NER tagger model yet well
+#: below a memory-exhaustion payload. Raise it if a legitimately larger model is
+#: needed.
+MAX_TOOL_MODEL_BYTES = 512 * 1024 * 1024
+
+#: Ceiling on the entries :func:`validate_tool_dir` audits for a private
+#: directory. A data directory an external tool reads holds at most a few
+#: hundred files; a far larger tree is refused, not walked unbounded (CWE-400).
+MAX_TOOL_DIR_ENTRIES = 10000
+
+# The child PATH resolves NOTHING: a single absolute, root-domain directory with
+# no executables. It denies bare-name command lookup (a trusted binary is run by
+# absolute path) and is NOT empty (an empty PATH element is the CWD; see safe_env).
+_LOCKED_PATH = "/nonexistent"
+
+# Only these variables reach a spawn_trusted child. Anything that can redirect a
+# dynamic linker, loader or interpreter (LD_*, DYLD_*, PYTHON*, PERL5LIB, ...) is
+# deliberately absent, so a trusted binary cannot be subverted through its env.
+_ENV_KEEP = frozenset(
+    {
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "TZ",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_NUMERIC",
+        "LC_TIME",
+    }
+)
+
+
+class TrustError(OSError):
+    """Raised by :func:`spawn_trusted` when the target fails verification."""
+
+
+def _private_stat(st):
+    """POSIX: owner is the effective user or root, and no group/world write bit."""
+    if st.st_uid not in (os.geteuid(), 0):
+        return False
+    return not (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def _is_junction(st):
+    """Windows: the ``lstat`` result is a directory junction. NTFS reports one
+    as a directory rather than a symlink, so ``S_ISLNK`` misses it and only the
+    reparse tag tells it apart from the directory it names."""
+    tag = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None)
+    return tag is not None and getattr(st, "st_reparse_tag", 0) == tag
+
+
 def is_private_dir(path):
     """Return True if *path* is a directory safe to trust as a data root: another
     *unprivileged local user* cannot plant files in it.
 
     This is the test that distinguishes a shared, world-writable temp directory
-    (Linux ``/tmp``, mode ``1777``) -- which a local attacker could use to plant
-    trusted-looking data (CWE-377/CWE-378) -- from a *private* per-user temp
+    (Linux ``/tmp``, mode ``1777``), which a local attacker could use to plant
+    trusted-looking data (CWE-377/CWE-378), from a *private* per-user temp
     directory (macOS ``$TMPDIR`` ``/var/folders/...`` mode ``0700``, Windows
     ``%TEMP%`` under the ACL-protected user profile), which is safe.
 
     Cross-platform:
-      * POSIX: the directory must be owned by the current user (or root) and be
-        neither group- nor world-writable (unless the writable group/other bit
-        is paired with the sticky bit *and* the dir is user-owned -- but we keep
-        it strict and simply reject any group/other-writable dir).
-      * Windows: ``st_uid``/mode are not meaningful; the per-user temp/profile is
-        ACL-protected, so a plain "exists and is a directory" check is used.
+      * POSIX: the directory must be owned by the effective user (or by root) and
+        be neither group- nor world-writable. A sticky world-writable directory
+        (``/tmp``) is rejected too: other users can still pre-create entries in it
+        and a pre-created entry wins any race.
+      * Windows: ``st_uid``/mode are not meaningful without pywin32; the per-user
+        temp/profile is ACL-protected, so a plain "exists and is a directory"
+        check is used (a heuristic, not a DACL check).
+
+    Owner/mode can also lie on NFS with uid squashing, some FUSE mounts, and
+    unprivileged user namespaces; POSIX ACLs surface in the group bits on Linux
+    ext4/xfs but not universally.
     """
     try:
         st = os.stat(path)
-    except OSError:
+    except (OSError, ValueError):
         return False
     if not stat.S_ISDIR(st.st_mode):
         return False
@@ -85,13 +157,259 @@ def is_private_dir(path):
         # Windows / other: rely on the per-user profile ACLs (no POSIX mode).
         return True
     # Must be owned by us (or by root, e.g. a system-wide /usr/share dir).
-    if st.st_uid not in (os.getuid(), 0):
+    if st.st_uid not in (os.geteuid(), 0):
         return False
     # Reject group- or world-writable directories: those let another account
     # write into (or, without the sticky bit, replace) the directory.
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         return False
     return True
+
+
+def _resolve_private(path, _hops=0):
+    """Resolve *path* one component at a time, following each symlink hop and
+    applying :func:`is_private_dir` to every directory encountered (including
+    each intermediate link's holding directory and its target's ancestors).
+
+    Returns the fully resolved path, or None if the input is unusable or any
+    directory on the way is not private. Unlike ``os.path.realpath``, every
+    intermediate symlink hop is checked, so a link that passes through an
+    attacker-writable directory is refused. The check is strict: a shared,
+    world-writable directory is rejected even with the sticky bit (Linux
+    ``/tmp``), so a trusted binary must live under a private root. NLTK's own
+    scratch output goes through :func:`nltk.data.make_staging_dir`, which stages
+    inside a private data root, never in ``/tmp``.
+    """
+    if _hops > _MAX_LINK_HOPS:
+        return None
+    text = _plain_path_text(path)
+    # Only an absolute, NUL-free path is resolvable. A relative path resolves
+    # against the attacker-controllable CWD; a '..' is refused, not folded, since
+    # os.path.abspath collapses it lexically before symlinks resolve (skips a link).
+    if text is None or "\x00" in text or not os.path.isabs(text):
+        return None
+    cur = os.sep
+    for part in text.split(os.sep):
+        if not part or part == os.curdir:  # '' and '.' are inert
+            continue
+        if part == os.pardir:  # '..' is never folded here; refuse it
+            return None
+        if not is_private_dir(cur):  # the directory that holds `part`
+            return None
+        nxt = os.path.join(cur, part)
+        try:
+            st = os.lstat(nxt)
+        except (OSError, ValueError):
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                link = os.readlink(nxt)
+            except OSError:
+                return None
+            # Re-resolve the target from the root (an absolute link replaces the
+            # base; a relative one joins onto its holding dir), so every ancestor
+            # of the target is checked too. Hop-bounded against symlink loops.
+            nxt = _resolve_private(os.path.join(cur, link), _hops + 1)
+            if nxt is None:
+                return None
+        cur = nxt
+    return cur
+
+
+def resolve_trusted_executable(target):
+    """Return the resolved path of *target* if no other unprivileged local user
+    can substitute it before it runs, else None (CWE-426/CWE-427/CWE-732).
+
+    POSIX: every directory from the root down to the target (following each
+    symlink hop) must be private (:func:`is_private_dir`), and the final target
+    must be a REGULAR file owned by us or root with no group/world write bit
+    (:func:`_private_stat`). The returned path is fully resolved, so callers
+    should execute THAT, not the original name. A same-UID attacker and root are
+    out of scope (they already control the process).
+
+    Non-POSIX (Windows): best-effort (see :func:`_resolve_trusted_nonposix`). The
+    POSIX ownership check cannot run and NLTK does not assume win32security for a
+    DACL check, so this layer degrades to the others: ``find_binary_iter`` already
+    refuses a CWD-relative match (the main CWE-426 vector on Windows, cf. GitPython
+    CVE-2023-40590) and :func:`spawn_trusted` still refuses a shell and scrubs the
+    environment. It does NOT fail closed, so Windows tool wrappers keep working.
+    """
+    if os.name != "posix":
+        return _resolve_trusted_nonposix(target)
+    real = _resolve_private(target)
+    if real is None:
+        return None
+    try:
+        st = os.stat(real)
+    except (OSError, ValueError):
+        return None
+    if not stat.S_ISREG(st.st_mode) or not _private_stat(st):
+        return None
+    return real
+
+
+def _plain_path_text(value):
+    """The real characters of a ``str`` path-like *value* as an exact ``str``,
+    or None if it is not a str path (int, None, list, and bytes, which the
+    trusted resolvers have always refused: the finder decodes a bytes location
+    before it gets here).
+
+    ``os.fspath`` hands a ``str`` subclass back unchanged, so a subclass that
+    overrides ``startswith``, ``__contains__`` or ``__getitem__`` would answer
+    the trust checks with lies; copying out with ``str.__str__`` (which ignores
+    a ``__str__`` override) makes every check run on the real value, exactly as
+    :func:`_as_path_text` does for the data-path guards."""
+    try:
+        text = os.fspath(value)
+    except TypeError:
+        return None
+    if not isinstance(text, str):
+        return None
+    if type(text) is not str:
+        text = str.__str__(text)
+    return text
+
+
+def _resolve_trusted_nonposix(target):
+    """Best-effort resolution on a non-POSIX platform (Windows).
+
+    POSIX owner/mode bits do not describe who can write a path, and a real
+    exec-trust answer needs the object's DACL (win32security), which NLTK does not
+    assume as a dependency, so the ownership layer cannot be enforced here. Rather
+    than fail closed (which would break every Windows tool wrapper), accept a
+    regular file at the resolved absolute path and rely on the other layers:
+    find_binary_iter refuses a CWD-relative match and spawn_trusted refuses a
+    shell and scrubs the loader environment. No environment-derived root allowlist
+    is consulted (that is not a trust boundary)."""
+    text = _plain_path_text(target)
+    if text is None or "\x00" in text:
+        return None
+    try:
+        real = os.path.realpath(text)
+        st = os.stat(real)
+    except (OSError, ValueError):
+        return None
+    return real if stat.S_ISREG(st.st_mode) else None
+
+
+def is_trusted_executable(target):
+    """Boolean form of :func:`resolve_trusted_executable`."""
+    return resolve_trusted_executable(target) is not None
+
+
+#: Unicode categories that must never appear in a token handed to a line-oriented
+#: tool: control characters (``Cc``), line/paragraph separators (``Zl``/``Zp``),
+#: and lone surrogates (``Cs``, which cannot be UTF-8 encoded and would otherwise
+#: raise UnicodeEncodeError as the token is written to the tool).
+_LINE_UNSAFE_CATEGORIES = frozenset({"Cc", "Zl", "Zp", "Cs"})
+
+
+def has_line_unsafe_char(token, allow_tab=False):
+    """Return True if *token* holds a character unsafe to hand to a line-oriented
+    external tool (CWE-93).
+
+    Unsafe means any Unicode control character (category ``Cc``, covering the C0
+    controls including TAB / CR / LF / NUL / the FS-GS-RS separators, the C1
+    controls, ``DEL`` and ``NEL``), a line or paragraph separator (``Zl`` / ``Zp``:
+    ``U+2028`` / ``U+2029``), or a lone surrogate (``Cs``). These are exactly the
+    characters that add or truncate a line on the tool's stdin, split a field in a
+    tab-separated stdout (TAB), or fail to UTF-8 encode (surrogate); the ``Cc`` +
+    ``Zl`` + ``Zp`` set matches ``str.splitlines()`` so no line break slips past.
+    Ordinary token content stays valid: letters, marks, numbers, punctuation,
+    symbols, ordinary and non-breaking spaces, and the format characters used in
+    real multilingual text (zero-width joiner / non-joiner, bidi marks) are never
+    flagged, so those tokens keep working.
+
+    ``allow_tab=True`` exempts a literal TAB, for a tool whose stdout is NOT
+    tab-delimited and that treats a tab as ordinary in-line whitespace (e.g. REPP
+    sentences, candc input lines). It stays blocked by default because a tab in a
+    token corrupts a tab-separated output line (Senna, hunpos).
+
+    Accepts ``str`` or ``bytes``. For ``bytes`` only the C0 controls and ``DEL``
+    are detected, because the C1 controls and the Unicode separators encode to
+    bytes ``0x80`` through ``0xBF`` that also serve as UTF-8 continuation bytes;
+    decode the bytes and pass the ``str`` to check those in full.
+    """
+    if isinstance(token, (bytes, bytearray)):
+        return any(
+            (b < 0x20 or b == 0x7F) and not (allow_tab and b == 0x09) for b in token
+        )
+    # Judge the real characters: a str subclass can lie in __iter__ and
+    # __contains__ (and str() of another object may hand back such a subclass),
+    # and str.__str__ copies the text out without consulting it.
+    text = str.__str__(token if isinstance(token, str) else str(token))
+    # str.isprintable is false for every Cc / Cs / Zl / Zp character (and for
+    # some safe ones, which fall through to the category rule), so a printable
+    # token is safe by the same rule at a fraction of the per-character cost.
+    if text.isprintable():
+        return False
+    return any(
+        unicodedata.category(ch) in _LINE_UNSAFE_CATEGORIES
+        and not (allow_tab and ch == "\t")
+        for ch in text
+    )
+
+
+def safe_env():
+    """A minimal child environment for a trusted binary: the _ENV_KEEP names plus
+    a PATH that resolves no command.
+
+    Deny-by-default WHITELIST: everything outside _ENV_KEEP is dropped, so a
+    loader/interpreter variable (LD_*, DYLD_*, PYTHON*, PERL5LIB, GCONV_PATH,
+    LOCPATH, NLSPATH, TERMINFO, IFS, ...) is removed even if no denylist named it.
+    PATH is replaced with :data:`_LOCKED_PATH` so the child cannot resolve
+    ``sh``/``python``/any helper by bare name (a rich PATH is exactly what turns
+    one leaked writable directory, or a shell-out on attacker input, into full
+    command execution), while never being empty (an empty/unset PATH is searched
+    as the current directory, so a planted ``./tool`` would run, CWE-426). There
+    is no ``extra`` parameter, so nothing dropped here can be reintroduced.
+
+    This scrubs the ENVIRONMENT only; it is one layer, not the whole defense. The
+    binary's own trust (that it cannot be swapped) is :func:`resolve_trusted_
+    executable`'s job, and a child that loads a plugin or config from the current
+    working directory is the caller's concern (pass ``cwd=``). The kept identity
+    variables (HOME, SHELL, TZ) can still steer a tool's OWN config lookups; they
+    are retained because they are not loader-injection vectors and dropping them
+    breaks ordinary tools. A caller whose tool genuinely must find system
+    utilities by name should pass its own ``env`` with a PATH of validated,
+    non-writable directories.
+    """
+    env = {k: v for k, v in os.environ.items() if k in _ENV_KEEP}
+    env["PATH"] = _LOCKED_PATH
+    return env
+
+
+def spawn_trusted(target, args=(), **popen_kw):
+    """Verify *target* with :func:`resolve_trusted_executable` and start it with
+    :class:`subprocess.Popen`, raising :class:`TrustError` if it is untrusted.
+
+    ``shell`` may not be set (a shell would re-interpret the command); ``env``
+    defaults to :func:`safe_env` and ``close_fds`` to True. The resolved path is
+    what gets executed, and argv[0] is that same resolved path.
+
+    Executing the resolved path is race-free against the in-scope attacker
+    (another unprivileged local user). :func:`resolve_trusted_executable` has
+    already proved that every directory from the root down to the target is
+    owned by us or root and is not writable by anyone else, so no such user can
+    substitute the binary, or any component of its path, between the check and
+    the exec. A same-uid process and root are out of scope: they already control
+    this process, so no exec-time trick would contain them. This is why no
+    ``/proc/self/fd`` fexecve dance is used; it would only harden that
+    out-of-scope race while adding a Linux-only, magic-symlink exec path.
+    """
+    if popen_kw.get("shell"):
+        raise ValueError(
+            "Security Violation [spawn_trusted]: shell=True is refused; a shell "
+            "would re-interpret the trusted command on caller-supplied args "
+            "(CWE-78). Pass an argv list and no shell."
+        )
+    popen_kw.setdefault("env", safe_env())
+    popen_kw.setdefault("close_fds", True)
+
+    real = resolve_trusted_executable(target)
+    if real is None:
+        raise TrustError(f"refusing to execute untrusted path: {target!r}")
+    return subprocess.Popen([real, *args], executable=real, **popen_kw)
 
 
 def _get_allowed_roots():
@@ -148,6 +466,44 @@ def _get_allowed_roots():
     return roots
 
 
+def _exact_path_text(value, context="NLTK"):
+    """The characters a native open would see for ``value``, as an exact str.
+
+    A ``str`` subclass can override ``__str__`` (or carry a ``path`` attribute)
+    to show one path while ``shelve``, ``sqlite3`` or ``os.open`` use its real
+    characters, so a check that trusted ``str(value)`` validated one file and
+    let another be opened. ``str.__str__`` ignores every override. A non-str
+    object is read through ``__fspath__`` when it has one, since that is what a
+    native open uses; if it also carries a ``path`` attribute naming something
+    else, the object is refused outright rather than validated on one face and
+    opened on the other. A pointer with only a ``path`` attribute (a dataset
+    pointer) is taken from that attribute, as :func:`open` does.
+    """
+    if isinstance(value, str):
+        return str.__str__(value)
+    shown = getattr(value, "path", None)
+    shown = str.__str__(shown) if isinstance(shown, str) else None
+    if hasattr(value, "__fspath__"):
+        try:
+            real = os.fspath(value)
+        except TypeError as exc:
+            raise PermissionError(
+                f"Security Violation [{context}]: {value!r} is not a filesystem path"
+            ) from exc
+        if isinstance(real, bytes):
+            real = os.fsdecode(real)
+        real = str.__str__(real)
+        if shown is not None and shown != real:
+            raise PermissionError(
+                f"Security Violation [{context}]: path object names two different "
+                f"files ({shown!r} via .path, {real!r} via __fspath__); refusing it"
+            )
+        return real
+    if shown is not None:
+        return shown
+    return str(value)
+
+
 def validate_path(path_input, context="NLTK", required_root=None):
     """
     Ensures file access is restricted to allowed data directories.
@@ -168,7 +524,7 @@ def validate_path(path_input, context="NLTK", required_root=None):
     if isinstance(path_input, int) or not path_input:
         return
     try:
-        raw = path_input.path if hasattr(path_input, "path") else str(path_input)
+        raw = _exact_path_text(path_input, context)
 
         # A NUL byte truncates a path in every C filesystem API and can never be
         # legitimate; refuse it explicitly (Path.resolve() surfaces it only on some
@@ -180,7 +536,7 @@ def validate_path(path_input, context="NLTK", required_root=None):
             )
             if ENFORCE:
                 raise PermissionError(msg)
-            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+            warnings.warn(sanitize_terminal(msg), RuntimeWarning, stacklevel=3)
             return
 
         # Reject a URL outright: no caller validates a network URL here, and
@@ -193,7 +549,7 @@ def validate_path(path_input, context="NLTK", required_root=None):
             )
             if ENFORCE:
                 raise PermissionError(msg)
-            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+            warnings.warn(sanitize_terminal(msg), RuntimeWarning, stacklevel=3)
             return
         if _FILE_SCHEME_RE.match(raw):
             parsed = urlparse(raw)
@@ -232,7 +588,7 @@ def validate_path(path_input, context="NLTK", required_root=None):
                 )
                 if ENFORCE:
                     raise PermissionError(msg)
-                warnings.warn(msg, RuntimeWarning, stacklevel=3)
+                warnings.warn(sanitize_terminal(msg), RuntimeWarning, stacklevel=3)
                 return
             lower_raw = raw.lower()
             if ".zip" in lower_raw:
@@ -244,11 +600,7 @@ def validate_path(path_input, context="NLTK", required_root=None):
         # LAYER 1: Scoped Sandbox (PR #3528 Integration)
         # This resolves both target and root to block symlink-based escapes.
         if required_root:
-            root_raw = (
-                required_root.path
-                if hasattr(required_root, "path")
-                else str(required_root)
-            )
+            root_raw = _exact_path_text(required_root, context)
             scoped_root = Path(root_raw).resolve()
             if not (target == scoped_root or target.is_relative_to(scoped_root)):
                 # Raise ValueError to match NLTK's historical CorpusReader error type
@@ -275,7 +627,7 @@ def validate_path(path_input, context="NLTK", required_root=None):
                     raise PermissionError(msg)
                 else:
                     warnings.warn(
-                        f"Security Warning [{context}]: Path {target} allowed via CWD.",
+                        f"Security Warning [{sanitize_terminal(context)}]: Path {sanitize_terminal(target)} allowed via CWD.",
                         RuntimeWarning,
                         stacklevel=3,
                     )
@@ -283,11 +635,17 @@ def validate_path(path_input, context="NLTK", required_root=None):
         except (OSError, ValueError):
             pass
 
-        msg = f"Security Violation [{context}]: Unauthorized path {target}"
+        # The refused path is attacker-controlled and the exception text is
+        # shown on a terminal by the default excepthook, so it is sanitised
+        # for the raise as well as for the warning.
+        msg = (
+            f"Security Violation [{sanitize_terminal(context)}]: "
+            f"Unauthorized path {sanitize_terminal(target)}"
+        )
         if ENFORCE:
             raise PermissionError(msg)
         else:
-            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+            warnings.warn(sanitize_terminal(msg), RuntimeWarning, stacklevel=3)
     except (PermissionError, ValueError):
         raise
     except Exception:
@@ -327,7 +685,7 @@ def _is_windows_device_name(raw):
     return leaf.split(".", 1)[0].strip().upper() in _WINDOWS_RESERVED_NAMES
 
 
-def _reject_colliding_members(members):
+def _reject_colliding_members(members, context="zip member"):
     """Refuse an archive with two members that collide on a case-insensitive or
     unicode-normalizing filesystem.
 
@@ -340,17 +698,47 @@ def _reject_colliding_members(members):
     """
     import unicodedata
 
-    seen = {}
+    def _refuse(first, second, why):
+        raise ValueError(
+            f"Security Violation [{context}]: members {first!r} and {second!r} "
+            f"{why}, so one would silently overwrite the other (resource "
+            "poisoning)."
+        )
+
+    # Keyed the way the hardened extractor writes: a backslash is a separator
+    # and empty or "." parts vanish, so "a//b" and "a/./b" are "a/b" as well.
+    seen, parents = {}, {}
     for name in members:
         text = name.filename if hasattr(name, "filename") else str(name)
-        key = unicodedata.normalize("NFC", text).casefold()
-        if key in seen and seen[key] != text:
-            raise ValueError(
-                "Refusing zip: members %r and %r collide on a case-insensitive "
-                "or normalizing filesystem, so one would silently overwrite the "
-                "other (resource poisoning)." % (seen[key], text)
-            )
-        seen[key] = text
+        parts = [p for p in text.replace("\\", "/").split("/") if p not in ("", ".")]
+        if not parts:
+            continue  # an empty name is refused by the extractor itself
+        key = unicodedata.normalize("NFC", "/".join(parts)).casefold()
+        is_dir = text.endswith("/")
+        if key in seen:
+            other, other_is_dir = seen[key]
+            if other != text:
+                _refuse(
+                    other,
+                    text,
+                    "collide on a case-insensitive or normalizing filesystem",
+                )
+            if not (is_dir and other_is_dir):
+                # zipfile resolves both to the LAST entry, while a reviewer's
+                # tool may show the first: a duplicate file is ambiguous.
+                _refuse(other, text, "are the same file listed twice")
+        seen[key] = (text, is_dir)
+        for depth in range(1, len(parts)):
+            parents.setdefault("/".join(parts[:depth]), text)
+    # A file that is also a parent directory of another member: one of the two
+    # fails half way through an extraction that has already written files.
+    folded = {
+        unicodedata.normalize("NFC", parent).casefold(): member
+        for parent, member in parents.items()
+    }
+    for key, (text, is_dir) in seen.items():
+        if not is_dir and key in folded:
+            _refuse(text, folded[key], "are a file and a directory of one name")
 
 
 def _reject_url_shaped(raw, context):
@@ -388,9 +776,12 @@ def _as_path_text(value, context, error=ValueError):
         ) from exc
     if isinstance(text, bytes):
         # A bytes path is a legal spelling on POSIX, so decode it rather than
-        # refusing; every check below then runs on the decoded characters.
+        # refusing. os.fsdecode would call the value's own decode(), which a bytes
+        # subclass can override; the unbound bytes.decode reads the real bytes.
         try:
-            text = os.fsdecode(text)
+            text = bytes.decode(
+                text, sys.getfilesystemencoding(), sys.getfilesystemencodeerrors()
+            )
         except (UnicodeDecodeError, ValueError) as exc:
             raise error(
                 f"Security Violation [{context}]: {text!r} is not decodable as a "
@@ -557,7 +948,13 @@ def _reject_aliased_or_special(text, context, check_links=False):
 
 
 def validate_tool_path(
-    path_input, context="NLTK tool", *, for_write=False, must_exist=True
+    path_input,
+    context="NLTK tool",
+    *,
+    for_write=False,
+    must_exist=True,
+    max_bytes=None,
+    require_private=False,
 ):
     """Bound a filesystem path handed to an external tool to read or write.
 
@@ -577,7 +974,13 @@ def validate_tool_path(
       own kernel path, so a symlink or an intermediate directory swapped in after
       the name check is refused (CWE-59);
     * refuses a FIFO, socket, device or directory, whose open would block forever
-      or stream unbounded data (CWE-400).
+      or stream unbounded data (CWE-400);
+    * with ``max_bytes``, refuses an over-large regular file the tool would load
+      whole into memory (a model-size bomb, CWE-400);
+    * with ``require_private``, refuses a file that is group/world-writable or not
+      owned by the caller or root, which another local user could plant or swap
+      before the tool parses it (CWE-426/CWE-732; POSIX only, best-effort on
+      Windows like the executable-trust check).
 
     A path-taking sink can never be fully race-free, since the callee re-resolves
     the name, but every attack that does not require winning that race is
@@ -603,16 +1006,48 @@ def validate_tool_path(
     _reject_url_shaped(text, context)
     validate_path(text, context=context)
     _reject_aliased_or_special(text, context, check_links=for_write)
-    _reject_unsafe_open(text, context, must_exist)
+    _reject_unsafe_open(
+        text, context, must_exist, max_bytes=max_bytes, require_private=require_private
+    )
     return text
 
 
-def _reject_unsafe_open(raw, context, must_exist):
+def _reject_oversize(st, raw, context, max_bytes):
+    """Refuse a file whose size exceeds *max_bytes* (CWE-400). ``st`` is the stat
+    of the already-validated regular file, so this reads the size that was open,
+    not a re-resolved name."""
+    if max_bytes is not None and st.st_size > max_bytes:
+        raise PermissionError(
+            f"Security Violation [{context}]: file {raw!r} is {st.st_size} bytes, "
+            f"over the {max_bytes}-byte tool-model limit; a file this large in a "
+            f"data root would exhaust memory in the tool's parser (CWE-400)."
+        )
+
+
+def _reject_tamperable(st, raw, context, require_private):
+    """POSIX: refuse a file another local user could plant or swap. ``st`` is the
+    fstat of the already-opened (O_NOFOLLOW) fd, so the owner/mode checked is the
+    file the tool will read, not a re-resolved name (CWE-426/CWE-732)."""
+    if require_private and os.name == "posix" and not _private_stat(st):
+        raise PermissionError(
+            f"Security Violation [{context}]: file {raw!r} is group/world-writable "
+            f"or not owned by you or root; another local user could plant or swap "
+            f"the model content the tool then parses (CWE-426/CWE-732). Remove the "
+            f"group/world write bits (chmod go-w) or copy it somewhere private."
+        )
+
+
+def _reject_unsafe_open(
+    raw, context, must_exist, max_bytes=None, require_private=False
+):
     """Open-time hardening for a path already bounded by :func:`validate_path`.
 
     Closes the window between the name check and the tool's own open: an
     intermediate directory or the leaf itself may be swapped for a symlink in
-    between, which no name-based check can see.
+    between, which no name-based check can see. When *max_bytes* is set, also
+    refuses an over-large regular file (a model-size memory bomb, CWE-400); when
+    *require_private* is set, refuses a file another local user could tamper with
+    (CWE-426/CWE-732).
     """
     if not ENFORCE:
         return
@@ -629,6 +1064,17 @@ def _reject_unsafe_open(raw, context, must_exist):
             raise PermissionError(
                 f"Security Violation [{context}]: path {raw!r} is not a " "regular file"
             )
+        # The same hardlink refusal the POSIX branch applies through fstat:
+        # st_nlink is reported on Windows too, so an in-root alias of an
+        # outside inode is turned away on every platform, read or write.
+        if st.st_nlink > 1:
+            raise PermissionError(
+                f"Security Violation [{context}]: refusing multiply-linked file "
+                f"{raw!r} (st_nlink={st.st_nlink}); a hardlink names an inode that "
+                "may live outside the sandbox (CWE-59)"
+            )
+        _reject_oversize(st, raw, context, max_bytes)
+        _reject_tamperable(st, raw, context, require_private)
         return
 
     flags = (
@@ -670,6 +1116,8 @@ def _reject_unsafe_open(raw, context, must_exist):
                 f"{raw!r} (st_nlink={st.st_nlink}); a hardlink names an inode that "
                 "may live outside the sandbox (CWE-59)"
             )
+        _reject_oversize(st, raw, context, max_bytes)
+        _reject_tamperable(st, raw, context, require_private)
         actual = _fd_realpath(fd)
         validate_path(
             actual if actual is not None else os.path.realpath(raw), context=context
@@ -678,7 +1126,7 @@ def _reject_unsafe_open(raw, context, must_exist):
         os.close(fd)
 
 
-def validate_tool_dir(path_input, context="NLTK tool"):
+def validate_tool_dir(path_input, context="NLTK tool", *, require_private=False):
     """Validate a *directory* a tool or NLTK itself will write model files into.
 
     The file-shaped physical checks in :func:`validate_tool_path` do not apply
@@ -688,14 +1136,79 @@ def validate_tool_dir(path_input, context="NLTK tool"):
     frozen ``__fspath__``, never a re-read one) and the same name refusals (blank,
     NUL, option-shaped, URL, ``..``, NTFS stream, drive-relative, Windows device)
     run before containment.
+
+    With ``require_private`` the directory is one an external tool READS its
+    data from (a model, dictionary or resource tree handed to a subprocess),
+    so it must exist and be a real directory rather than a symlink or a
+    Windows junction, and everything beneath it must be a regular file or a
+    subdirectory (no symlink, junction, FIFO, socket or device). On POSIX it
+    and everything beneath it must also be private: owned by the caller or
+    root with no group/world write bit. Otherwise another local user could
+    plant or swap the files the tool then parses (CWE-426/CWE-732, and CWE-59
+    for a symlink). The walk runs on every platform and is bounded by
+    :data:`MAX_TOOL_DIR_ENTRIES`.
     """
     text = _as_path_text(path_input, context, error=PermissionError)
     _reject_bad_name_syntax(text, context, error=PermissionError)
     _reject_url_shaped(text, context)
     validate_path(text, context=context)
+    if require_private:
+        _reject_tamperable_dir(text, context)
     # Returned for the same reason as validate_tool_path: the caller must build
     # from the checked string, not re-read a value that can resolve differently.
     return text
+
+
+def _reject_tamperable_dir(raw, context):
+    """Refuse a directory a tool reads model data from unless it is a real,
+    private directory tree (see :func:`validate_tool_dir`). ``raw`` has already
+    passed containment; this adds the physical and ownership checks."""
+    if not ENFORCE:
+        return
+
+    def _refuse(path, why):
+        raise PermissionError(
+            f"Security Violation [{context}]: {path!r} {why}; another local user "
+            "could plant or swap the model data the tool then parses "
+            "(CWE-426/CWE-732)."
+        )
+
+    leaf = raw.rstrip("/\\") or raw
+    try:
+        top = os.lstat(leaf)
+    except FileNotFoundError:
+        _refuse(raw, "does not exist")
+    if stat.S_ISLNK(top.st_mode):
+        _refuse(raw, "is a symlink, not the directory it names")
+    if _is_junction(top):
+        _refuse(raw, "is a junction, not the directory it names")
+    if not stat.S_ISDIR(top.st_mode):
+        _refuse(raw, "is not a directory")
+    # Off POSIX the owner/mode bits do not say who can write and no DACL model
+    # is assumed, so ownership is audited on POSIX only; the bounded walk below
+    # (planted links or junctions, non-regular entries, size) runs everywhere.
+    check_owner = os.name == "posix"
+    if check_owner and not _private_stat(top):
+        _refuse(raw, "is group/world-writable or not owned by you or root")
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(leaf, followlinks=False):
+        for name in dirnames + filenames:
+            seen += 1
+            if seen > MAX_TOOL_DIR_ENTRIES:
+                _refuse(raw, f"holds over {MAX_TOOL_DIR_ENTRIES} entries, too many")
+            entry = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(entry)
+            except FileNotFoundError:
+                _refuse(entry, "vanished while the directory was being audited")
+            if stat.S_ISLNK(st.st_mode):
+                _refuse(entry, "is a symlink inside the tool directory")
+            if _is_junction(st):
+                _refuse(entry, "is a junction inside the tool directory")
+            if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+                _refuse(entry, "is not a regular file or directory")
+            if check_owner and not _private_stat(st):
+                _refuse(entry, "is group/world-writable or not owned by you or root")
 
 
 def open_package_resource(
@@ -789,11 +1302,14 @@ def validate_zip_archive(
                 _member_count_guard()(
                     len(members), getattr(zf, "filename", None) or "<archive>"
                 )
-                _reject_colliding_members(members)
+                _reject_colliding_members(members, context)
             for name in members:
                 name_str = name.filename if hasattr(name, "filename") else str(name)
                 if "\0" in name_str:
-                    raise ValueError(f"Null byte in ZIP member: {name_str}")
+                    raise ValueError(
+                        f"Security Violation [{context}]: NUL byte in ZIP member "
+                        f"{name_str!r}"
+                    )
 
                 # ``resolve()`` follows symlinks, catching escapes through a
                 # pre-existing symlinked subpath. The extra component check
@@ -803,11 +1319,18 @@ def validate_zip_archive(
                 if _zip_member_is_unsafe(name_str) or not (
                     member_path == target or member_path.is_relative_to(target)
                 ):
-                    msg = f"Security Violation [{context}]: Traversal member '{name_str}' detected."
+                    # the member name comes from the archive, so the exception
+                    # text is sanitised for the raise as well as the warning
+                    msg = (
+                        f"Security Violation [{sanitize_terminal(context)}]: "
+                        f"Traversal member '{sanitize_terminal(name_str)}' detected."
+                    )
                     if ENFORCE:
                         raise PermissionError(msg)
                     else:
-                        warnings.warn(msg, RuntimeWarning, stacklevel=3)
+                        warnings.warn(
+                            sanitize_terminal(msg), RuntimeWarning, stacklevel=3
+                        )
 
         if isinstance(zip_obj_or_path, zipfile.ZipFile):
             _audit(zip_obj_or_path)
@@ -822,7 +1345,9 @@ def validate_zip_archive(
         raise
     except (OSError, zipfile.BadZipFile):
         if ENFORCE:
-            raise PermissionError("Zip validation failed")
+            raise PermissionError(
+                f"Security Violation [{context}]: Zip validation failed"
+            )
 
 
 @lru_cache(maxsize=256)
@@ -994,7 +1519,7 @@ def validate_network_url(url_input, context="NetworkIO"):
             if ENFORCE:
                 raise PermissionError(msg)
             else:
-                warnings.warn(msg, RuntimeWarning, stacklevel=3)
+                warnings.warn(sanitize_terminal(msg), RuntimeWarning, stacklevel=3)
             return
 
         host = parsed.hostname or ""
@@ -1009,7 +1534,7 @@ def validate_network_url(url_input, context="NetworkIO"):
             if ENFORCE:
                 raise PermissionError(msg)
             else:
-                warnings.warn(msg, RuntimeWarning, stacklevel=3)
+                warnings.warn(sanitize_terminal(msg), RuntimeWarning, stacklevel=3)
             return
 
         # Classify an IP-literal host (chiefly a bracketed IPv6 literal such as
@@ -1026,7 +1551,7 @@ def validate_network_url(url_input, context="NetworkIO"):
             if ENFORCE:
                 raise PermissionError(msg)
             else:
-                warnings.warn(msg, RuntimeWarning, stacklevel=3)
+                warnings.warn(sanitize_terminal(msg), RuntimeWarning, stacklevel=3)
             return
 
         for result in _resolve_hostname(host):
@@ -1036,7 +1561,7 @@ def validate_network_url(url_input, context="NetworkIO"):
                 if ENFORCE:
                     raise PermissionError(msg)
                 else:
-                    warnings.warn(msg, RuntimeWarning, stacklevel=3)
+                    warnings.warn(sanitize_terminal(msg), RuntimeWarning, stacklevel=3)
     except (PermissionError, ValueError):
         raise
     except Exception:
@@ -1076,7 +1601,7 @@ def _resolve_and_validate_host(host, port):
             msg = f"Security Violation [pathsec.urlopen]: SSRF attempt to restricted IP {ip}"
             if ENFORCE:
                 raise PermissionError(msg)
-            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+            warnings.warn(sanitize_terminal(msg), RuntimeWarning, stacklevel=2)
     return addrinfo
 
 
@@ -1186,7 +1711,7 @@ def _reject_unpinnable_proxied_fetch(url_str):
     )
     if ENFORCE:
         raise PermissionError(msg)
-    warnings.warn(msg, RuntimeWarning, stacklevel=3)
+    warnings.warn(sanitize_terminal(msg), RuntimeWarning, stacklevel=3)
 
 
 def _env_proxy_carries(url_str):
@@ -1321,6 +1846,48 @@ def _os_open_flags(mode):
     return access | creat
 
 
+def _is_special_file(st):
+    """True for a FIFO, socket or device inode: never data, and a FIFO blocks."""
+    mode = st.st_mode
+    return (
+        stat.S_ISFIFO(mode)
+        or stat.S_ISSOCK(mode)
+        or stat.S_ISCHR(mode)
+        or stat.S_ISBLK(mode)
+    )
+
+
+def _reject_link_or_special_by_name(raw_path, context):
+    """The hardened open's inode policy, checked by name for non-POSIX opens.
+
+    Without ``O_NOFOLLOW`` the fallback open would follow a symlink planted at
+    the final component, read or write through a hardlink to an outside inode,
+    or open a device such as ``NUL``. ``lstat`` sees the link itself, so each of
+    those is refused before the open; a name that does not exist yet (an output
+    file about to be created) has nothing to check.
+    """
+    try:
+        st = os.lstat(raw_path)
+    except OSError:
+        return
+    if stat.S_ISLNK(st.st_mode):
+        raise PermissionError(
+            f"Security Violation [{context}]: refusing to follow a symlink at "
+            f"{raw_path!r} (CWE-59)"
+        )
+    if _is_special_file(st):
+        raise PermissionError(
+            f"Security Violation [{context}]: {raw_path!r} is a FIFO, socket or "
+            "device, not data; refusing to open it"
+        )
+    if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+        raise PermissionError(
+            f"Security Violation [{context}]: refusing multiply-linked file "
+            f"{raw_path!r} (st_nlink={st.st_nlink}); a hardlink can point at an "
+            "outside-root inode (CWE-59)"
+        )
+
+
 def _hardened_open(raw_path, mode, context, required_root, **kwargs):
     """Open ``raw_path`` for read *or* write, closing the symlink-swap TOCTOU and
     the hardlink escape that a path-only ``validate_path`` cannot.
@@ -1350,6 +1917,7 @@ def _hardened_open(raw_path, mode, context, required_root, **kwargs):
         _os_open_flags(mode)
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
     )
     # Defer O_TRUNC until after the hardlink/realpath checks: truncating at open
     # time would zero a hardlinked outside-root target before st_nlink refuses it.
@@ -1357,6 +1925,8 @@ def _hardened_open(raw_path, mode, context, required_root, **kwargs):
     flags &= ~os.O_TRUNC
     try:
         # 0o600 is only consulted when O_CREAT is in flags (write/append/x modes).
+        # O_NONBLOCK keeps a planted FIFO from blocking the open until a peer
+        # appears; it is cleared again below once the inode is known to be a file.
         fd = os.open(raw_path, flags, 0o600)
     except OSError as e:
         if e.errno in (errno.ELOOP, errno.EMLINK):
@@ -1364,9 +1934,26 @@ def _hardened_open(raw_path, mode, context, required_root, **kwargs):
                 f"Security Violation [pathsec.open]: refusing to follow a symlink "
                 f"at open time for {raw_path!r} (TOCTOU guard, CWE-59)"
             ) from e
+        if e.errno in _REFUSING_ERRNOS:
+            raise PermissionError(
+                f"Security Violation [pathsec.open]: {raw_path!r} is a socket or "
+                "other special file, not data; refusing to open it"
+            ) from e
         raise
     try:
         st = os.fstat(fd)
+        if _is_special_file(st):
+            raise PermissionError(
+                f"Security Violation [pathsec.open]: {raw_path!r} is a FIFO, socket "
+                "or device, not data; reading it could block forever or reach a "
+                "device (CWE-59)"
+            )
+        if hasattr(os, "O_NONBLOCK"):
+            import fcntl
+
+            fcntl.fcntl(
+                fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK
+            )
         if st.st_nlink > 1:
             raise PermissionError(
                 f"Security Violation [pathsec.open]: refusing multiply-linked file "
@@ -1415,6 +2002,10 @@ def open(file, mode="r", *, context="pathsec.open", required_root=None, **kwargs
     if type(file) not in (str, bytes) and isinstance(
         getattr(file, "path", None), (str, bytes)
     ):
+        # A non-str object that also answers __fspath__ with a different name
+        # would be opened here on .path and elsewhere on __fspath__; refuse it.
+        if not isinstance(file, str) and hasattr(file, "__fspath__"):
+            _exact_path_text(file, context)
         file = file.path
 
     # 2. Force extraction of the real path from PathLike objects
@@ -1447,6 +2038,11 @@ def open(file, mode="r", *, context="pathsec.open", required_root=None, **kwargs
         # builtins.open on OSError -- retrying the raw path would follow a symlink
         # the hardened open deliberately refused, reopening the TOCTOU leak.
         return _hardened_open(raw_path, mode, context, required_root, **kwargs)
+    if ENFORCE:
+        # No O_NOFOLLOW off POSIX: apply the same inode policy by name, so a
+        # planted link or device is refused there too (not race-free, but never
+        # weaker than a plain open that follows it).
+        _reject_link_or_special_by_name(raw_path, context)
     return builtins.open(raw_path, mode=mode, **kwargs)
 
 
@@ -1551,6 +2147,12 @@ class ZipFile(zipfile.ZipFile):
 
     def extract(self, member, path=None, pwd=None):
         validate_zip_archive(self, path or os.getcwd(), specific_member=member)
+        # A caller extracting member by member (the downloader does) never
+        # reaches extractall's archive-wide collision check, so run it here,
+        # once per archive state.
+        if getattr(self, "_collisions_checked", None) != len(self.filelist):
+            _reject_colliding_members(self.filelist, "pathsec.ZipFile")
+            self._collisions_checked = len(self.filelist)
         self._extract_root = os.path.abspath(path or os.getcwd())
         return super().extract(member, path, pwd)
 
@@ -1576,60 +2178,122 @@ class ZipFile(zipfile.ZipFile):
         file/symlink at the target is refused too. On a platform without dir_fd
         support this falls back to the stdlib extractor.
         """
-        import shutil as _shutil
+        # extract()/extractall() pass member NAMES (strings); resolve to a
+        # ZipInfo so the hardened walk below (and its hardlink guard) engages
+        # instead of silently falling back to the stdlib extractor (CWE-59).
+        if not isinstance(member, zipfile.ZipInfo):
+            try:
+                member = self.getinfo(member)
+            except KeyError:
+                return super()._extract_member(member, targetpath, pwd)
 
+        # Directory members take the same walk: the stdlib's makedirs/mkdir
+        # would follow a component swapped for a symlink after validation.
         if (
             getattr(member, "filename", None) is None
-            or member.is_dir()
             or os.open not in os.supports_dir_fd
             or not getattr(os, "O_NOFOLLOW", 0)
         ):
             return super()._extract_member(member, targetpath, pwd)
 
-        # _extract_root is set by extract()/extractall(); when _extract_member is
-        # called directly, anchor at the target's parent.
-        root = getattr(self, "_extract_root", None) or os.path.dirname(targetpath)
-        rel = os.path.relpath(os.path.normpath(targetpath), os.path.normpath(root))
-        parts = [p for p in rel.split(os.sep) if p not in ("", os.curdir)]
+        # extract()/extractall() pass the extraction BASE dir as targetpath and
+        # set _extract_root; the member's own arcname is the archive-relative
+        # path to write. When called directly, targetpath is the full path.
+        root = getattr(self, "_extract_root", None)
+        if root is not None:
+            name = member.filename.replace("\\", "/")
+            parts = [p for p in name.split("/") if p not in ("", os.curdir)]
+        else:
+            root = os.path.dirname(os.path.abspath(targetpath))
+            rel = os.path.relpath(os.path.abspath(targetpath), root)
+            parts = [p for p in rel.split(os.sep) if p not in ("", os.curdir)]
+        if not parts and member.is_dir():
+            # "./" names the extraction base itself; the stdlib creates it.
+            os.makedirs(root, exist_ok=True)
+            return root
         if not parts or os.pardir in parts:
             raise PermissionError(
                 f"Security Violation [pathsec.ZipFile]: refusing member path "
-                f"{rel!r}"
+                f"{member.filename!r}"
             )
-        *dirs, leaf = parts
+        if member.is_dir():
+            dirs, leaf = parts, None
+        else:
+            *dirs, leaf = parts
+        written = os.path.join(root, *parts)
 
-        dir_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        # Open the member first, as the stdlib does: a bomb, a bad password or
+        # an unsupported method is then refused before any file exists.
+        source = None if leaf is None else self.open(member, pwd=pwd)
         try:
-            for component in dirs:
-                try:
-                    os.mkdir(component, 0o755, dir_fd=dir_fd)
-                except FileExistsError:
-                    pass
-                nxt = os.open(
-                    component,
-                    os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0),
-                    dir_fd=dir_fd,
-                )
-                os.close(dir_fd)
-                dir_fd = nxt
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            # The extraction base (the trusted destination) may not exist yet;
+            # the stdlib extractor makedirs it, so create it before dir_fd.
+            os.makedirs(root, exist_ok=True)
+            dir_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
-                leaf_fd = os.open(leaf, flags, 0o644, dir_fd=dir_fd)
-            except FileExistsError:
-                info = os.lstat(leaf, dir_fd=dir_fd)
-                if not stat.S_ISREG(info.st_mode):
-                    raise PermissionError(
-                        f"Security Violation [pathsec.ZipFile]: refusing to "
-                        f"extract onto non-regular file {leaf!r}"
+                for component in dirs:
+                    try:
+                        os.mkdir(component, 0o755, dir_fd=dir_fd)
+                    except FileExistsError:
+                        pass
+                    nxt = os.open(
+                        component,
+                        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0),
+                        dir_fd=dir_fd,
                     )
-                leaf_fd = os.open(
-                    leaf, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, dir_fd=dir_fd
-                )
+                    os.close(dir_fd)
+                    dir_fd = nxt
+                if leaf is not None:
+                    self._write_leaf(leaf, dir_fd, source)
+            finally:
+                os.close(dir_fd)
         finally:
-            os.close(dir_fd)
-        with os.fdopen(leaf_fd, "wb") as sink, self.open(member, pwd=pwd) as source:
-            _shutil.copyfileobj(source, sink)
-        return targetpath
+            if source is not None:
+                source.close()
+        return written
+
+    @staticmethod
+    def _write_leaf(leaf, dir_fd, source):
+        """Create *leaf* under *dir_fd* with O_EXCL | O_NOFOLLOW and copy
+        *source* into it; a copy that fails removes the file it created."""
+        import shutil as _shutil
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        try:
+            leaf_fd = os.open(leaf, flags, 0o644, dir_fd=dir_fd)
+        except FileExistsError:
+            info = os.lstat(leaf, dir_fd=dir_fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise PermissionError(
+                    f"Security Violation [pathsec.ZipFile]: refusing to "
+                    f"extract onto non-regular file {leaf!r}"
+                )
+            if info.st_nlink > 1:
+                raise PermissionError(
+                    f"Security Violation [pathsec.ZipFile]: refusing "
+                    f"multiply-linked file {leaf!r} (st_nlink="
+                    f"{info.st_nlink}); a hardlink may alias an "
+                    "outside-root inode (CWE-59)"
+                )
+            # Confirmed regular and single-linked: unlink then re-create
+            # with O_EXCL so re-extraction replaces the entry instead of
+            # truncating through a swapped-in alias.
+            os.unlink(leaf, dir_fd=dir_fd)
+            leaf_fd = os.open(leaf, flags, 0o644, dir_fd=dir_fd)
+        with os.fdopen(leaf_fd, "wb") as sink:
+            try:
+                _shutil.copyfileobj(source, sink)
+            except BaseException:
+                # Remove the partial file, but only while the name is still the
+                # inode created above: never unlink something swapped in.
+                try:
+                    if os.path.samestat(
+                        os.fstat(sink.fileno()), os.lstat(leaf, dir_fd=dir_fd)
+                    ):
+                        os.unlink(leaf, dir_fd=dir_fd)
+                except OSError:
+                    pass
+                raise
 
     def read(self, name, pwd=None):
         # Not the raw one-shot super().read() (bounded only by the attacker-declared
