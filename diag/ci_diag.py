@@ -81,9 +81,9 @@ def header():
                 out = subprocess.run(
                     ["sysctl", "-n", key], capture_output=True, text=True, timeout=5
                 )
-                print("  {} = {}".format(key, out.stdout.strip() or out.stderr.strip()))
+                print(f"  {key} = {out.stdout.strip() or out.stderr.strip()}")
             except Exception as exc:
-                print("  {} ? {}".format(key, exc))
+                print(f"  {key} ? {exc}")
     print("=" * 72)
 
 
