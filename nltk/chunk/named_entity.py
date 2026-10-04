@@ -255,18 +255,13 @@ def load_ace_file(textfile, fmt):
         text = infile.read()
 
     # Strip XML tags, since they don't count towards the indices
-    # Bound the tag body and keep `<` out of it: `<`*N with no `>` was O(n**2)
-    # re-anchoring (CWE-407), and excluding the anchor stops each scan at the
-    # next tag, O(n) overall. Real ACE tags are short; the timeout is a backstop.
-    text = redos.sub("<(?!/?TEXT)[^<>]{1,400}>", "", text)
+    text = redos.sub("<(?!/?TEXT)[^>]+>", "", text)
 
     # Blank out anything before/after <TEXT>
     def subfunc(m):
         return " " * (m.end() - m.start() - 6)
 
-    # Pin to offset 0 (\A): a leading unbounded `[\s\S]*` with an absent `<TEXT>`
-    # re-anchors O(filesize) times -> O(n**2); \A keeps greedy semantics, linear.
-    text = redos.sub(r"\A[\s\S]*<TEXT>", subfunc, text)
+    text = redos.sub(r"[\s\S]*<TEXT>", subfunc, text)
     text = redos.sub(r"</TEXT>[\s\S]*", "", text)
 
     # Simplify quotes

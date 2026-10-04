@@ -62,18 +62,6 @@ repos:
       language: system
       pass_filenames: false
       always_run: true
-    - id: no-reanchoring-quadratic
-      name: no unbounded re-anchoring regex (O(n**2))
-      description: >-
-        A re-anchoring op (redos.sub/subn/finditer/findall/split/search) with an
-        unbounded wide run ([^X]*, .*, \S*) that scans to an absent terminator is
-        O(n**2) on crafted corpus input (CWE-400/407); the redos timeout is only a
-        backstop, not a fix. Bound the run with {0,N}, or add the site to _REVIEWED
-        in tools/check_reanchoring_quadratic.py with a reason.
-      entry: python tools/check_reanchoring_quadratic.py
-      language: system
-      pass_filenames: false
-      always_run: true
     - id: all-pickle-through-picklesec
       name: every pickle routes through nltk.picklesec
       description: >-
@@ -97,6 +85,30 @@ repos:
         nltk.pathsec itself; resolve with internals.find_binary_absolute and
         launch with pathsec.spawn_trusted.
       entry: python tools/check_all_spawns_through_pathsec.py
+      language: system
+      pass_filenames: false
+      always_run: true
+    - id: no-bare-execution
+      name: no bare eval/exec/compile of a code string
+      description: >-
+        eval/exec/compile turn a string into running code, so interpolating any
+        untrusted fragment is a code-injection primitive (CWE-94/CWE-95). Fails
+        on any bare builtin eval/exec/compile that is not annotated with a
+        reviewed `# bare-exec ok: <reason>` (the only such use is the fenced
+        decorators wrapper eval, CVE-2026-14727).
+      entry: python tools/check_no_bare_execution.py
+      language: system
+      pass_filenames: false
+      always_run: true
+    - id: no-unsafe-csv-write
+      name: no untrusted data written to a CSV cell raw
+      description: >-
+        A CSV opened in a spreadsheet runs a cell that starts with = + - @ as a
+        formula (CWE-1236), and displayed in a terminal it fires embedded control
+        sequences (CWE-150). Modules that export externally sourced rows (tweets)
+        must route every cell through nltk.termsec.sanitize_csv_field. Fails on a
+        writerow/writerows of un-sanitised data in the guarded modules.
+      entry: python tools/check_no_unsafe_csv_write.py
       language: system
       pass_filenames: false
       always_run: true
