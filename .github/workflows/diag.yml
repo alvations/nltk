@@ -38,4 +38,4 @@ jobs:
         run: python diag/ci_diag.py
       - name: Runner diagnostics beside xdist-sized load
         shell: bash
-        run: python diag/ci_diag.py spread relextract srl ratios load
+        run: python diag/ci_diag.py spread relextract srl ratios regimes load

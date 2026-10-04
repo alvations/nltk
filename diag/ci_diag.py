@@ -11,7 +11,12 @@ Measures, on the machine it runs on:
   4. two ways of taking the small/big scaling ratio, over repeated trials:
      the current helper (min of single runs on each side) and a block form
      (the small side timed as four calls in one block, so both sides are
-     about as long and sample the same rate windows).
+     about as long and sample the same rate windows);
+  5. the three runner regimes that test_timing.py replays on a fake clock,
+     simulated here as the live tests of #3949 did with a sibling thread
+     taking turns at the interpreter lock, a linear and a quadratic sink
+     each, read under the old rule and the paired rule from the same
+     samples, over repeated trials.
 Prints plain text; nothing is asserted.
 """
 
@@ -22,6 +27,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 ROOT = os.environ.get("DIAG_ROOT") or os.path.dirname(
@@ -75,9 +81,9 @@ def header():
                 out = subprocess.run(
                     ["sysctl", "-n", key], capture_output=True, text=True, timeout=5
                 )
-                print("  %s = %s" % (key, out.stdout.strip() or out.stderr.strip()))
+                print("  {} = {}".format(key, out.stdout.strip() or out.stderr.strip()))
             except Exception as exc:
-                print("  %s ? %s" % (key, exc))
+                print("  {} ? {}".format(key, exc))
     print("=" * 72)
 
 
@@ -320,16 +326,171 @@ def ratio_trials(label):
         undo()
 
 
+# ---- 5. the runner regimes, simulated with a sibling thread at the lock ----
+# The simulation the live regime tests of test_timing.py used before the
+# fake-clock replays: a sibling thread takes turns at the interpreter lock
+# while a regime says so, the measured thread samples a linear and a
+# quadratic sink through the real scaling_samples, and the old rule and the
+# paired rule are read from the same samples. The load a sample bears here
+# depends on how the host schedules the thread, which is what this measures.
+
+
+class _Sibling:
+    """One thread that takes turns at the interpreter lock while ``spinning``
+    is set, holding it for about ``HOLD_INTERVALS`` switch intervals at a
+    time inside a C call that the eval loop cannot interrupt."""
+
+    HOLD_INTERVALS = 5
+
+    def __init__(self):
+        self.spinning, self.stopped = threading.Event(), False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        hold = self.HOLD_INTERVALS * sys.getswitchinterval()
+        n = 100_000
+        while True:
+            started = time.perf_counter()
+            sum(range(n))
+            took = time.perf_counter() - started
+            if took >= hold:
+                break
+            n *= 2
+        self.n = int(n * hold / took)
+
+    def _run(self):
+        while not self.stopped:
+            if self.spinning.wait(0.01):
+                sum(range(self.n))
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stopped = True
+        self.spinning.set()
+        self.thread.join()
+        return False
+
+
+# clean CPU seconds of one small call of a regime sink: twice the rule's floor
+_REGIME_SMALL_SECONDS = 0.2
+
+
+def _work(n):
+    x = 0
+    for _ in range(n):
+        x += 1
+    return x
+
+
+def _regime_linear(n, small):
+    _work(n)
+
+
+def _regime_quadratic(n, small):
+    _work(n * n // small)
+
+
+def _regime_sizes(timing):
+    rate = min(timing.calibration_rate() for _ in range(3))
+    small = int(_REGIME_SMALL_SECONDS / (rate / timing.CALIBRATION_CHUNK))
+    return small, 4 * small
+
+
+def _regime_samples(timing, sink, spin_at):
+    """Samples of ``sink(n, small)`` under a regime: ``spin_at(call_index,
+    n, big)`` says whether the sibling spins from the start of that call."""
+    small, big = _regime_sizes(timing)
+    calls = []
+    with _Sibling() as sibling:
+        if spin_at(0, small, big):
+            sibling.spinning.set()
+
+        def op(n):
+            if spin_at(len(calls), n, big):
+                sibling.spinning.set()
+            else:
+                sibling.spinning.clear()
+            calls.append(n)
+            sink(n, small)
+
+        return timing.scaling_samples(op, small, big)
+
+
+def _old_rule(samples, floor=0.1):
+    return min(s.big_cpu for s in samples) / max(
+        min(s.small_cpu for s in samples), floor
+    )
+
+
+def _regime_table(timing):
+    block = timing.SMALL_BLOCK
+    last_big = 3 * (block + 1) - 1
+    second_block = range(block + 1, 2 * block + 1)
+    return {
+        "slowdown": lambda i, n, big: i >= block,
+        "sibling": lambda i, n, big: i < last_big,
+        "fastwindow": lambda i, n, big: i not in second_block,
+    }
+
+
+def regimes(label, n=8):
+    from nltk.test.unit import timing
+
+    if not getattr(sys, "_is_gil_enabled", lambda: True)():
+        print("[regime %-6s] skipped: no interpreter lock to take turns at" % label)
+        return
+    for name, spin_at in _regime_table(timing).items():
+        for sink_name, sink in (
+            ("linear", _regime_linear),
+            ("quadratic", _regime_quadratic),
+        ):
+            olds, news = [], []
+            t0 = time.perf_counter()
+            for trial in range(n):
+                samples = _regime_samples(timing, sink, spin_at)
+                old = _old_rule(samples)
+                new = timing.paired_ratio(samples, cpu_bound=True)
+                olds.append(old)
+                news.append(new)
+                print(
+                    "[regime %-6s %-10s %-9s] trial %d: old %.2fx paired %.2fx  %s"
+                    % (label, name, sink_name, trial, old, new, samples)
+                )
+            olds.sort()
+            news.sort()
+            print(
+                "[regime %-6s %-10s %-9s] old min %.2fx med %.2fx max %.2fx over 8: %d/%d"
+                "  paired min %.2fx med %.2fx max %.2fx over 8: %d/%d  (%.0fs)"
+                % (
+                    label,
+                    name,
+                    sink_name,
+                    olds[0],
+                    olds[len(olds) // 2],
+                    olds[-1],
+                    sum(r >= 8 for r in olds),
+                    n,
+                    news[0],
+                    news[len(news) // 2],
+                    news[-1],
+                    sum(r >= 8 for r in news),
+                    n,
+                    time.perf_counter() - t0,
+                )
+            )
+
+
 def main():
     header()
-    which = sys.argv[1:] or ["spread", "relextract", "srl", "ratios"]
+    which = sys.argv[1:] or ["spread", "relextract", "srl", "ratios", "regimes"]
     loaded = "load" in which
     siblings = []
     if "spread" in which:
         spread("idle")
     if loaded:
         ctx = multiprocessing.get_context("spawn")
-        siblings = [ctx.Process(target=_busy, args=(900,)) for _ in range(2)]
+        siblings = [ctx.Process(target=_busy, args=(3600,)) for _ in range(2)]
         for p in siblings:
             p.start()
         time.sleep(1)
@@ -343,6 +504,8 @@ def main():
             srl(label)
         if "ratios" in which:
             ratio_trials(label)
+        if "regimes" in which:
+            regimes(label)
     finally:
         for p in siblings:
             p.terminate()
