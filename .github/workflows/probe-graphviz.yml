@@ -1,0 +1,39 @@
+# Scratch probe on the fork only, never proposed upstream: reproduce the
+# TestRealGraphviz failure on the current ubuntu-latest image and check the
+# install line of branch ci-graphviz-neato-layout against it.
+name: probe-graphviz
+on: push
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Image
+        run: grep -E '^(PRETTY_NAME|VERSION_ID)' /etc/os-release
+      - name: Install nltk and pytest
+        run: pip install -q -e . pytest pytest-mock defusedxml
+      - name: Graphviz as develop installs it
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq graphviz
+          dot -V
+          dpkg -l | grep -E 'libgvplugin|libgvc' | awk '{print $2, $3}'
+          echo 'digraph { a -> b }' | dot -Kcirco -Tsvg > /dev/null && echo "circo layout: OK" || echo "circo layout: FAILS"
+      - name: TestRealGraphviz with graphviz alone (expected to fail)
+        continue-on-error: true
+        env:
+          NLTK_CI_REQUIRE_GRAPHVIZ: "1"
+          PYTHONSAFEPATH: "1"
+        run: python -m pytest -q -p no:cacheprovider -rs nltk/test/unit/test_attack_trusted_symlink_expanded.py -k TestRealGraphviz
+      - name: The fix's install line
+        run: |
+          sudo apt-get install -y -qq graphviz $(apt-cache --names-only search '^libgvplugin-neato-layout[0-9]+$' | cut -d' ' -f1)
+          dpkg -l | grep -E 'libgvplugin|libgvc' | awk '{print $2, $3}'
+          echo 'digraph { a -> b }' | dot -Kcirco -Tsvg > /dev/null && echo "circo layout: OK"
+      - name: TestRealGraphviz after the fix (must pass)
+        env:
+          NLTK_CI_REQUIRE_GRAPHVIZ: "1"
+          PYTHONSAFEPATH: "1"
+        run: python -m pytest -q -p no:cacheprovider -rs nltk/test/unit/test_attack_trusted_symlink_expanded.py -k TestRealGraphviz
