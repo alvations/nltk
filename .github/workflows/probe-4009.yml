@@ -43,14 +43,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      NLTK_DATA: ${{ runner.temp }}/nltk_data_probe
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - run: pip install regex click joblib tqdm defusedxml
+      - run: echo "NLTK_DATA=$RUNNER_TEMP/nltk_data_probe" >> "$GITHUB_ENV"
       - name: trees (3.10.3 from PyPI, develop from nltk/nltk, this branch)
         run: |
           pip install --no-deps --target "$RUNNER_TEMP/v3103" nltk==3.10.3
