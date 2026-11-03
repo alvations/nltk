@@ -163,12 +163,12 @@ jobs:
           PYTHONSAFEPATH: "1"
         run: |
           set -uo pipefail
-          files=$(ls nltk/test/unit/ | grep -E 'attack|redos|pickle|json|xml|pathsec|termsec|csvsec|security|path_traversal|regex' | grep -v -E '^test_advisory_(probes|coverage_ci)\.py$' | sed 's#^#nltk/test/unit/#' | grep '\.py$')
+          files=$(ls nltk/test/unit/ | grep -E 'attack|redos|pickle|json|xml|pathsec|termsec|csvsec|security|path_traversal|regex|capped|punkt|fast_paths' | grep -v -E '^test_advisory_(probes|coverage_ci)\.py$' | sed 's#^#nltk/test/unit/#' | grep '\.py$')
           echo "$(echo "$files" | wc -l) files"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -p xdist -p pytest_mock --numprocesses auto -rsx -q $files
+            PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -p xdist -p pytest_mock --numprocesses auto -rfEs -q $files
           else
-            pytest --numprocesses auto -rsx -q $files
+            pytest --numprocesses auto -rfEs -q $files
           fi
 
       - name: Advisory probes
@@ -209,3 +209,56 @@ jobs:
         run: |
           python tools/bench/teeth.py --base "$BASE_SHA" | tee teeth.md
           cat teeth.md >> "$GITHUB_STEP_SUMMARY"
+
+  unit-suite:
+    # ci.yml's own pytest run (doctests included), for when its third-party
+    # download step cannot reach a host: tests that need those tools skip.
+    name: unit suite ${{ matrix.os }} py${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.14"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      NLTK_DATA: ${{ github.workspace }}/nltk_data
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install --upgrade --requirement requirements-ci.txt
+
+      - name: Give the runner's JDK back its private write bits (Linux)
+        if: runner.os == 'Linux'
+        run: sudo chmod -R go-w /usr/lib/jvm
+
+      - name: Cache nltk data
+        uses: actions/cache@v6
+        id: nltk-data-cache
+        with:
+          path: ${{ github.workspace }}/nltk_data
+          key: nltk_data_${{ runner.os }}_v2
+
+      - name: Download nltk data on cache miss
+        if: steps.nltk-data-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          python -c "import os; import nltk; from pathlib import Path; path = Path(os.environ['NLTK_DATA']); path.mkdir(parents=True, exist_ok=True); nltk.download('all', download_dir=path)"
+
+      - name: Run pytest as ci.yml does
+        shell: bash
+        env:
+          PYTHONSAFEPATH: "1"
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -p xdist -p pytest_mock --numprocesses auto --ignore=nltk/test/unit/test_advisory_probes.py -q -rfE --doctest-modules nltk
+          else
+            pytest --numprocesses auto --ignore=nltk/test/unit/test_advisory_probes.py -q -rfE --doctest-modules nltk
+          fi

@@ -40,6 +40,26 @@ def _append(rel, code):
     return patch
 
 
+def _replace(rel, old, new):
+    def patch(tree, _base):
+        path = os.path.join(tree, rel)
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        assert text.count(old) == 1, (rel, old)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text.replace(old, new))
+
+    return patch
+
+
+def _from_ref(ref, rel):
+    def patch(tree, _base):
+        with open(os.path.join(tree, rel), "wb") as f:
+            f.write(_show(ref, rel))
+
+    return patch
+
+
 def _from_base(rel):
     def patch(tree, base):
         with open(os.path.join(tree, rel), "wb") as f:
@@ -48,6 +68,7 @@ def _from_base(rel):
     return patch
 
 
+U = "nltk/test/unit"
 PICKLE_TESTS = [
     "nltk/test/unit/test_attack_pickle_ext_scan.py::test_base0_int_line_no_longer_hides_ext",
     "nltk/test/unit/test_attack_pickle_ext_scan.py::test_scan_never_stops_on_argument_content",
@@ -69,7 +90,93 @@ MUTANTS = {
             "nltk/test/unit/test_pickle_allowlist_security.py::TestExtensionOpcodeBypassBlocked"
         ],
     ),
+    "picklesec-no-frame-rule": (
+        _from_ref("b9386c7d1", "nltk/picklesec.py"),
+        [
+            f"{U}/test_attack_pickle_ext_scan.py::test_argument_across_a_frame_end_cannot_hide_ext"
+        ],
+    ),
     "jsontags-develop-scan": (_from_base("nltk/jsontags.py"), JSON_TESTS),
+    "jsontags-walk-skips-every-container": (
+        _append("nltk/jsontags.py", "def _finite_numbers(values):\n    return True"),
+        [f"{U}/test_jsontags_fast_paths.py::test_non_finite_weight_is_still_refused"],
+    ),
+    "jsontags-bracket-count-zero": (
+        _append(
+            "nltk/jsontags.py", "def _bracket_depth(residue, limit):\n    return 0"
+        ),
+        [
+            f"{U}/test_jsontags_fast_paths.py::test_bracket_count_returns_what_the_loop_returns"
+        ]
+        + JSON_TESTS[:1],
+    ),
+    "jsontags-read-ignores-cap": (
+        _append(
+            "nltk/jsontags.py",
+            "def _read_capped(reader, size):\n    return reader.read()",
+        ),
+        [
+            f"{U}/test_capped_reads_memory.py::test_capped_json_read_refuses_and_reads_exactly_as_one_read"
+        ],
+    ),
+    "jsontags-read-reserves-request": (
+        _append("nltk/jsontags.py", "_READ_STEP = 10**12"),
+        [
+            f"{U}/test_capped_reads_memory.py::test_a_small_json_file_no_longer_reserves_the_cap"
+        ],
+    ),
+    "data-read-reserves-request": (
+        _append("nltk/data.py", "_READ_STEP = 10**12"),
+        [
+            f"{U}/test_capped_reads_memory.py::test_a_small_json_file_no_longer_reserves_the_cap"
+        ],
+    ),
+    "termsec-no-dangerous-search": (
+        _append("nltk/termsec.py", "_PRINTABLE_BUT_DANGEROUS_SORTED = ()"),
+        [f"{U}/test_termsec_fast_paths.py::test_every_code_point_alone"],
+    ),
+    "termsec-separators-unsanitised": (
+        _append(
+            "nltk/termsec.py",
+            "class _Everything:\n    def __contains__(self, item):\n        return True\n\n\n"
+            "_CLEAN_SEPARATORS = _Everything()",
+        ),
+        [
+            f"{U}/test_termsec_fast_paths.py::test_default_separators_are_printed_as_before"
+        ],
+    ),
+    "pathsec-within-any-ignores-parents": (
+        _append(
+            "nltk/pathsec.py",
+            "def _within_any(target, roots):\n    return target in roots",
+        ),
+        [f"{U}/test_pathsec_fast_paths.py::test_containment_matches_is_relative_to"],
+    ),
+    "pathsec-within-any-always": (
+        _append("nltk/pathsec.py", "def _within_any(target, roots):\n    return True"),
+        [f"{U}/test_pathsec_fast_paths.py::test_containment_matches_is_relative_to"],
+    ),
+    "pathsec-scheme-always-skipped": (
+        _append("nltk/pathsec.py", "def _may_name_a_scheme(raw):\n    return False"),
+        [f"{U}/test_pathsec_fast_paths.py::test_url_shapes_are_still_refused"],
+    ),
+    "punkt-numeric-shortcut-on-digits": (
+        _append(
+            "nltk/tokenize/punkt.py",
+            "_NOT_NUMBER_START = frozenset(map(chr, range(0x80)))",
+        ),
+        [
+            f"{U}/test_punkt_fast_paths.py::test_numeric_type_matches_the_regex_for_every_first_character"
+        ],
+    ),
+    "punkt-ellipsis-shortcut-always": (
+        _replace("nltk/tokenize/punkt.py", 'self.tok[:2] != ".."', "True"),
+        [f"{U}/test_punkt_fast_paths.py::test_is_ellipsis_matches_the_regex"],
+    ),
+    "punkt-initial-shortcut-always": (
+        _replace("nltk/tokenize/punkt.py", 'self.tok[1:2] != "."', "True"),
+        [f"{U}/test_punkt_fast_paths.py::test_is_initial_matches_the_regex"],
+    ),
     "jsontags-no-depth-scan": (
         _append(
             "nltk/jsontags.py",

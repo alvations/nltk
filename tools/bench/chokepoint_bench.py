@@ -204,6 +204,29 @@ def _w(_):
     return {"tree": run, "stdlib": run_std}
 
 
+@workload("redos.clock_micro", "redos")
+def _w(_):
+    import regex
+
+    pat, s = r"^-?[\.,]?\d[\d,\.-]*\.?$", "fine."
+    rx = regex.compile(pat)
+    n = 100_000
+
+    def run():
+        m = rx.match
+        for _ in range(n):
+            m(s, timeout=5.0)
+        return n
+
+    def run_plain():
+        m = rx.match
+        for _ in range(n):
+            m(s)
+        return n
+
+    return {"tree": run, "stdlib": run_plain}
+
+
 @workload("redos.helper_micro", "redos")
 def _w(_):
     import re
@@ -566,11 +589,59 @@ def _w(_):
     parts = []
     for p in _brown_tei_paths():
         with open(p, "rb") as f:
-            parts.append(f.read())
+            part = f.read()
+        if part.startswith(b"<?xml"):
+            part = part.split(b"?>", 1)[1]
+        parts.append(part)
     doc = b"<corpus>" + b"".join(parts) + b"</corpus>"
     return {
         "tree": lambda: len(list(xmlsec.fromstring(doc).iter())),
         "stdlib": lambda: len(list(ElementTree.fromstring(doc).iter())),
+    }
+
+
+@workload("xml.brown_tei_defused_only", "xml")
+def _w(_):
+    from xml.etree import ElementTree
+
+    try:
+        from defusedxml.ElementTree import parse as defused_parse
+    except ImportError:
+        return None
+    paths = _brown_tei_paths()
+    return {
+        "tree": lambda: sum(len(list(defused_parse(p).iter())) for p in paths),
+        "stdlib": lambda: sum(len(list(ElementTree.parse(p).iter())) for p in paths),
+    }
+
+
+@workload("xml.brown_tei_screen_cparse", "xml")
+def _w(_):
+    from xml.etree import ElementTree
+
+    from nltk import xmlsec
+
+    if not hasattr(xmlsec, "_check_tree"):
+        return None
+    docs = []
+    for p in _brown_tei_paths():
+        with open(p, "rb") as f:
+            docs.append(f.read())
+
+    def run():
+        total = 0
+        for d in docs:
+            xmlsec._screen(d)
+            root = ElementTree.fromstring(d)
+            xmlsec._check_tree(root)
+            total += len(list(root.iter()))
+        return total
+
+    return {
+        "tree": run,
+        "stdlib": lambda: sum(
+            len(list(ElementTree.fromstring(d).iter())) for d in docs
+        ),
     }
 
 
