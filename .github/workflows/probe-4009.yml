@@ -44,7 +44,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
-      NLTK_DATA: ${{ github.workspace }}/../nltk_data_probe
+      NLTK_DATA: ${{ runner.temp }}/nltk_data_probe
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -58,7 +58,7 @@ jobs:
           git worktree add "$RUNNER_TEMP/develop" FETCH_HEAD
           git -C "$RUNNER_TEMP/develop" log -1 --format='develop %H'
       - name: punkt_tab
-        run: python -c "import nltk; nltk.download('punkt_tab', download_dir='$NLTK_DATA', quiet=True); print(nltk.data.find('tokenizers/punkt_tab/english/'))"
+        run: python -c "import os, nltk; nltk.download('punkt_tab', download_dir=os.environ['NLTK_DATA'], quiet=True); print(nltk.data.find('tokenizers/punkt_tab/english/'))"
       - name: fetch the pinned pages
         run: python probe_4009/wiki.py fetch "$RUNNER_TEMP/wiki"
       - name: tokenize

@@ -142,6 +142,8 @@ def run(data, trees):
         for label in labels:
             r = res[label]
             cells.append(f"{r['status']} {r['cpu']}s" + (f" ({r['sents']} sents)" if r["status"] == "ok" else ""))
+            if r["status"] == "crash":
+                print("CRASH", name, kind, label, r["err"].replace("\n", " | "), file=sys.stderr)
         print(f"| {name} {title} | {kind} | {chars:,} | " + " | ".join(cells) + " |")
     print()
     print("\n".join(f"FAIL: {b}" for b in bad) or "PASS: branch completes every text with the reference output")
