@@ -1,0 +1,68 @@
+name: probe-4009
+
+# Fork-only probe for the redos finditer PR (#4009); never merged.
+on:
+  push:
+    branches: [probe-4009-teeth-wiki]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  teeth:
+    name: teeth ${{ matrix.os }} py${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install regex click joblib tqdm defusedxml pytest pytest-mock "pytest-xdist[psutil]"
+      - name: develop's redos.py
+        run: |
+          git fetch --depth 1 https://github.com/nltk/nltk.git develop
+          git show FETCH_HEAD:nltk/redos.py > "$RUNNER_TEMP/develop_redos.py"
+          git log -1 --format='develop %H' FETCH_HEAD
+      - name: branch, develop and two mutants against the new tests
+        run: python probe_4009/teeth.py "$RUNNER_TEMP/develop_redos.py" "$RUNNER_TEMP/teeth" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  wiki:
+    name: wiki punkt ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      NLTK_DATA: ${{ github.workspace }}/../nltk_data_probe
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install regex click joblib tqdm defusedxml
+      - name: trees (3.10.3 from PyPI, develop from nltk/nltk, this branch)
+        run: |
+          pip install --no-deps --target "$RUNNER_TEMP/v3103" nltk==3.10.3
+          git fetch --depth 1 https://github.com/nltk/nltk.git develop
+          git worktree add "$RUNNER_TEMP/develop" FETCH_HEAD
+          git -C "$RUNNER_TEMP/develop" log -1 --format='develop %H'
+      - name: punkt_tab
+        run: python -c "import nltk; nltk.download('punkt_tab', download_dir='$NLTK_DATA', quiet=True); print(nltk.data.find('tokenizers/punkt_tab/english/'))"
+      - name: fetch the pinned pages
+        run: python probe_4009/wiki.py fetch "$RUNNER_TEMP/wiki"
+      - name: tokenize
+        run: |
+          python probe_4009/wiki.py run "$RUNNER_TEMP/wiki" \
+            "3.10.3=$RUNNER_TEMP/v3103" "develop=$RUNNER_TEMP/develop" \
+            "reference=$RUNNER_TEMP/develop" "branch=$GITHUB_WORKSPACE" | tee -a "$GITHUB_STEP_SUMMARY"

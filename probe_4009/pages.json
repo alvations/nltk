@@ -1,0 +1,65 @@
+{
+ "source": "en.wikipedia.org Special:LongPages top 10, fetched 2026-11-03",
+ "pages": [
+  {
+   "rank": 1,
+   "title": "Opinion polling for the next Italian general election",
+   "revid": 1383447645,
+   "wikitext_sha256": "98a0be956aa13d0851d7cd647522e3a8e4e33fa23c33603c62a62c264b0d43ad"
+  },
+  {
+   "rank": 2,
+   "title": "Japanese pitch accent",
+   "revid": 1383607385,
+   "wikitext_sha256": "e7ce3663b9d7863fd9d4a22abc0b374ca5842df6d97ac65493dd4ed03e6962c8"
+  },
+  {
+   "rank": 3,
+   "title": "List of rodents",
+   "revid": 1383381415,
+   "wikitext_sha256": "eae70eddb98b673a3e41485ede134ca772430da543e8d659b97a8683b8d71310"
+  },
+  {
+   "rank": 4,
+   "title": "Opinion polling for the 2026 Spanish general election",
+   "revid": 1383431757,
+   "wikitext_sha256": "0f21474d5aea863253701d82c80f970a5a824ca76043ab62488a07af6fc9c329"
+  },
+  {
+   "rank": 5,
+   "title": "2024 United States House of Representatives elections in California",
+   "revid": 1382413587,
+   "wikitext_sha256": "9806c6245c3f0ed104ad56d1d32e1d9e082322184b9ebc6d6d70e9664318789b"
+  },
+  {
+   "rank": 6,
+   "title": "List of military aid to Ukraine during the Russo-Ukrainian war",
+   "revid": 1381679752,
+   "wikitext_sha256": "6696d1addf792d7093a22871479859aa9a3799552f2c0c66193ba6d3fa77be63"
+  },
+  {
+   "rank": 7,
+   "title": "Opinion polling for the 2015 United Kingdom general election",
+   "revid": 1373535755,
+   "wikitext_sha256": "ce9fcb8d5ff07a0f80a405fe0b17f8a0358f77a52fdcbeb59a13ee1b6f3b087b"
+  },
+  {
+   "rank": 8,
+   "title": "Opinion polling for the 2023 Spanish general election",
+   "revid": 1381583414,
+   "wikitext_sha256": "a9b5a74ea7dbebbe19916becd68455c5a296c48843c32be67257b07ecc678481"
+  },
+  {
+   "rank": 9,
+   "title": "Foreign relations of the United Kingdom",
+   "revid": 1383592991,
+   "wikitext_sha256": "630bb4a7a888e9cce323f557ba429ac7c8e7ba2d64b309b09b881567d5e00dd0"
+  },
+  {
+   "rank": 10,
+   "title": "Japanese conjugation",
+   "revid": 1380110917,
+   "wikitext_sha256": "152c9080bcd08287ab992422617c1052627261a2a9b9ed2c622314b44ab1df69"
+  }
+ ]
+}
