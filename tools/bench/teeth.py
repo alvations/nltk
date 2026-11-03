@@ -193,6 +193,13 @@ MUTANTS = {
         ),
         [f"{U}/test_toktok_fast_paths.py::test_no_match_without_a_needed_character"],
     ),
+    "treebank-needs-never-present": (
+        _append(
+            "nltk/tokenize/treebank.py",
+            '_NEEDS = {key: "\\x00" for key in _NEEDS}',
+        ),
+        [f"{U}/test_treebank_fast_paths.py::test_no_match_without_a_needed_character"],
+    ),
     "jsontags-no-depth-scan": (
         _append(
             "nltk/jsontags.py",
