@@ -1,0 +1,211 @@
+name: chokepoint-bench
+
+# Probe workflow for the alvations fork only: it measures what the security
+# chokepoints cost real workloads (branch vs develop vs the 3.10.3 wheel) and
+# runs the security harness on Pythons the push run of ci.yml leaves out.
+on:
+  push:
+    branches:
+      - "probe-chokepoint-bench-*"
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "space-separated workload name filters (empty = all)"
+        required: false
+        default: ""
+      repeat:
+        description: "timed repeats per child"
+        required: false
+        default: "3"
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: 47d43d8bc1364b2a0af933404e96368aa394e571
+
+jobs:
+  bench:
+    name: bench ${{ matrix.os }} py${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      NLTK_DATA: ${{ github.workspace }}/bench_data
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the runtime dependencies only
+        run: pip install regex click joblib tqdm defusedxml psutil
+
+      - name: Build the three trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=zip -o develop.zip "$BASE_SHA" nltk
+          git archive --format=zip -o branch.zip HEAD nltk
+          pip download --no-deps --only-binary=:all: nltk==3.10.3 -d wheel3103
+          python - <<'EOF'
+          import glob, zipfile
+          zipfile.ZipFile("develop.zip").extractall("trees/develop")
+          zipfile.ZipFile("branch.zip").extractall("trees/branch")
+          whl = glob.glob("wheel3103/*.whl")[0]
+          names = [n for n in zipfile.ZipFile(whl).namelist() if n.startswith("nltk/")]
+          zipfile.ZipFile(whl).extractall("trees/v3103", members=names)
+          EOF
+          ls trees/*/nltk/__init__.py
+          echo "branch HEAD: $(git rev-parse HEAD)  develop: $BASE_SHA"
+
+      - name: Cache the benchmark data
+        uses: actions/cache@v6
+        id: bench-data
+        with:
+          path: ${{ github.workspace }}/bench_data
+          key: nltk_bench_data_${{ runner.os }}_v1
+
+      - name: Download the benchmark data on a cache miss
+        if: steps.bench-data.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p "$NLTK_DATA"
+          PYTHONPATH=trees/branch python -c "import nltk, os; ok = nltk.download(['gutenberg', 'brown', 'treebank', 'conll2000', 'punkt_tab', 'averaged_perceptron_tagger_eng', 'averaged_perceptron_tagger_rus', 'twitter_samples', 'udhr', 'brown_tei'], download_dir=os.environ['NLTK_DATA']); assert ok"
+
+      - name: Make the data private (the trees refuse group-writable data)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: chmod -R go-w "$NLTK_DATA"
+
+      - name: Run the benchmark
+        shell: bash
+        env:
+          ONLY: ${{ github.event.inputs.only }}
+          REPEAT: ${{ github.event.inputs.repeat || '3' }}
+        run: |
+          set -euo pipefail
+          out="bench-${{ runner.os }}-py${{ matrix.python-version }}.json"
+          args=(drive --tree "branch=$PWD/trees/branch" --tree "develop=$PWD/trees/develop" --tree "v3103=$PWD/trees/v3103" --repeat "$REPEAT" --out "$PWD/$out")
+          if [ -n "$ONLY" ]; then args+=(--only $ONLY); fi
+          python tools/bench/chokepoint_bench.py "${args[@]}" | tee bench.log
+          python tools/bench/chokepoint_bench.py table "$out" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-${{ runner.os }}-py${{ matrix.python-version }}
+          path: |
+            bench-*.json
+            bench.log
+
+  security-harness:
+    name: harness ${{ matrix.os }} py${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      NLTK_DATA: ${{ github.workspace }}/nltk_data
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install --upgrade --requirement requirements-ci.txt
+
+      - name: Give the runner's JDK back its private write bits (Linux)
+        if: runner.os == 'Linux'
+        run: sudo chmod -R go-w /usr/lib/jvm
+
+      - name: Cache nltk data
+        uses: actions/cache@v6
+        id: nltk-data-cache
+        with:
+          path: ${{ github.workspace }}/nltk_data
+          key: nltk_data_${{ runner.os }}_v2
+
+      - name: Download nltk data on cache miss
+        if: steps.nltk-data-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          python -c "import os; import nltk; from pathlib import Path; path = Path(os.environ['NLTK_DATA']); path.mkdir(parents=True, exist_ok=True); nltk.download('all', download_dir=path)"
+
+      - name: Guard hooks
+        shell: bash
+        run: |
+          set -uo pipefail
+          rc=0
+          for hook in $(grep -o 'tools/check_[a-z_]*\.py' .pre-commit-config.yaml); do
+            echo "== $hook"
+            python "$hook" || rc=1
+          done
+          exit $rc
+
+      - name: Security and attack harness
+        shell: bash
+        env:
+          PYTHONSAFEPATH: "1"
+        run: |
+          set -uo pipefail
+          files=$(ls nltk/test/unit/ | grep -E 'attack|redos|pickle|json|xml|pathsec|termsec|csvsec|security|path_traversal|regex' | grep -v -E '^test_advisory_(probes|coverage_ci)\.py$' | sed 's#^#nltk/test/unit/#' | grep '\.py$')
+          echo "$(echo "$files" | wc -l) files"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -p xdist -p pytest_mock --numprocesses auto -rsx -q $files
+          else
+            pytest --numprocesses auto -rsx -q $files
+          fi
+
+      - name: Advisory probes
+        shell: bash
+        env:
+          PYTHONSAFEPATH: "1"
+        run: pytest -rsx -q nltk/test/unit/test_advisory_probes.py
+
+      - name: Doctests of the chokepoint modules
+        shell: bash
+        env:
+          PYTHONSAFEPATH: "1"
+        run: pytest -rsx -q --doctest-modules nltk/redos.py nltk/jsontags.py nltk/picklesec.py nltk/pathsec.py nltk/xmlsec.py nltk/termsec.py nltk/csvsec.py nltk/data.py
+
+  teeth:
+    name: teeth ${{ matrix.os }} py${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install regex click joblib tqdm defusedxml pytest pytest-mock numpy scipy scikit-learn
+
+      - name: Every weakened guard fails its committed tests
+        shell: bash
+        run: |
+          python tools/bench/teeth.py --base "$BASE_SHA" | tee teeth.md
+          cat teeth.md >> "$GITHUB_STEP_SUMMARY"
