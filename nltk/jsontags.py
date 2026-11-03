@@ -14,8 +14,11 @@ NLTK uses simple '!' tags to mark the types of objects, but the fully-qualified
 using it.
 """
 
+import io
+import itertools
 import json
 import math
+import operator
 
 json_tags = {}
 
@@ -98,6 +101,14 @@ def _reject_non_finite_walk(obj, context="NLTK JSON"):
     explicit stack, never recursion), so a document nested up to JSON_MAX_DEPTH
     cannot make this check itself overflow the stack (CWE-674). Returns ``obj`` so
     it can wrap the parse in one expression.
+
+    A container is not descended into when ``math.fsum`` adds up its members,
+    or the values of its members when they are all dicts, to a finite number:
+    ``fsum`` refuses a member that is no number (a string, a container, None)
+    and returns inf or NaN, or raises, whenever a member is non-finite, so a
+    finite sum proves that every number the walk would visit there is finite.
+    Model weights are a dict of dicts of floats, so the walk then sums them in
+    C instead of visiting each weight; any other container is walked as before.
     """
     stack = [obj]
     while stack:
@@ -107,11 +118,28 @@ def _reject_non_finite_walk(obj, context="NLTK JSON"):
                 raise ValueError(
                     f"{context}: non-finite JSON number (NaN/Infinity) is not allowed"
                 )
-        elif isinstance(cur, dict):
-            stack.extend(cur.values())
+            continue
+        if isinstance(cur, dict):
+            members = cur.values()
         elif isinstance(cur, list):
-            stack.extend(cur)
+            members = cur
+        else:
+            continue
+        if _finite_numbers(members) or _finite_numbers(
+            itertools.chain.from_iterable(map(dict.values, members))
+        ):
+            continue
+        stack.extend(members)
     return obj
+
+
+def _finite_numbers(values):
+    """True only if every item of *values* is a number and ``math.fsum`` of
+    them is finite, which no item that is a non-finite float allows."""
+    try:
+        return math.isfinite(math.fsum(values))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _parsed_text_utf8(data):
@@ -164,7 +192,15 @@ def _scan_json_depth(data, limit):
 def _utf8_depth(text, limit):
     """:func:`_scan_json_depth` of the parsed text already as UTF-8 bytes."""
     text = text.replace(b"\\\\", b"").replace(b'\\"', b"")
-    residue = text.translate(_IDENTITY_TABLE, _NON_STRUCTURAL)
+    # With no backslash left, quotes alternate open and close, so an adjacent
+    # pair is an empty string or a close then an open with nothing between:
+    # dropping it leaves every bracket inside or outside a string as it was.
+    residue = text.translate(_IDENTITY_TABLE, _NON_STRUCTURAL).replace(b'""', b"")
+    quotes = residue.count(b'"')
+    if quotes <= _SPLIT_QUOTES:
+        # Quotes alternate, so every other piece between them is outside any
+        # string; those pieces in order are the brackets the loop counts.
+        return _bracket_depth(b"".join(residue.split(b'"')[0::2]), limit)
     depth = 0
     max_depth = 0
     in_string = False
@@ -182,6 +218,33 @@ def _utf8_depth(text, limit):
         elif byte == 0x5D or byte == 0x7D:  # ']' or '}'
             depth -= 1
     return max_depth
+
+
+#: Brackets :func:`_bracket_depth` counts per step; a document past the cap is
+#: refused within one step of crossing it, as the loop refuses it there.
+_DEPTH_STEP = 1 << 16
+_STEP_OF = bytes.maketrans(b"[{]}", b"\x02\x02\x00\x00")
+#: Most quotes left in a residue that :func:`_utf8_depth` splits on (one small
+#: bytes object per piece); a residue with more takes the loop.
+_SPLIT_QUOTES = 1 << 16
+
+
+def _bracket_depth(residue, limit):
+    """What the loop in :func:`_utf8_depth` returns for brackets that are all
+    outside strings, counted at C speed: an opener is +1, a closer -1, and the
+    deepest running total is the depth. Like the loop it returns the first
+    depth past ``limit``."""
+    depth = best = 0
+    for start in range(0, len(residue), _DEPTH_STEP):
+        steps = residue[start : start + _DEPTH_STEP].translate(_STEP_OF)
+        totals = itertools.accumulate(
+            map(operator.sub, steps, itertools.repeat(1)), initial=depth
+        )
+        best = max(best, max(totals))
+        if best > limit and best > 0:
+            return max(limit + 1, 1)
+        depth += len(steps) - 2 * steps.count(0)
+    return best
 
 
 def safe_json_loads(
@@ -240,6 +303,32 @@ def safe_json_loads(
     return _reject_non_finite_walk(parsed, context)
 
 
+#: Bytes one read of a capped binary read asks for: a buffered stream
+#: allocates what it is asked for before reading, so one read of the whole cap
+#: reserved JSON_MAX_BYTES (200 MiB) for every model file loaded.
+_READ_STEP = 1 << 20
+
+
+def _read_capped(reader, size):
+    """``reader.read(size)``, asked of a buffered binary stream in steps of at
+    most ``_READ_STEP`` bytes, so it costs the bytes the stream holds rather
+    than ``size``. A buffered stream's ``read(n)`` returns fewer than ``n``
+    bytes only at the end, so steps that stop at ``size`` or at the first
+    empty read return exactly what one read would. Any other stream keeps the
+    single read: a raw one may return short, and a text stream counts in its
+    own unit (a code point, or a byte it decodes)."""
+    if not isinstance(reader, io.BufferedIOBase):
+        return reader.read(size)
+    parts, total = [], 0
+    while total < size:
+        part = reader.read(min(_READ_STEP, size - total))
+        if not part:
+            break
+        parts.append(part)
+        total += len(part)
+    return b"".join(parts)
+
+
 def safe_json_load(
     fp,
     *,
@@ -259,8 +348,7 @@ def safe_json_load(
     encoded byte length. Works with both text and binary streams.
     """
     # Prefer the binary buffer so the byte cap bounds the read itself.
-    reader = getattr(fp, "buffer", fp)
-    data = reader.read(max_bytes + 1)
+    data = _read_capped(getattr(fp, "buffer", fp), max_bytes + 1)
     if len(data) > max_bytes:
         raise ValueError(f"{context}: JSON resource exceeds the {max_bytes}-byte limit")
     return safe_json_loads(
